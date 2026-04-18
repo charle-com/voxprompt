@@ -11,16 +11,16 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/charlesneveu/voxprompt/releases/latest"><img src="https://img.shields.io/github/v/release/charlesneveu/voxprompt?style=flat-square&color=6E5EFF" alt="Latest release"/></a>
+  <a href="https://github.com/charle-com/voxprompt/releases/latest"><img src="https://img.shields.io/github/v/release/charle-com/voxprompt?style=flat-square&color=6E5EFF" alt="Latest release"/></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-black?style=flat-square" alt="macOS 14+"/>
   <img src="https://img.shields.io/badge/Apple_Silicon-required-black?style=flat-square" alt="Apple Silicon"/>
   <img src="https://img.shields.io/badge/Swift-5.10-orange?style=flat-square" alt="Swift"/>
   <img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License MIT"/>
-  <img src="https://img.shields.io/github/stars/charlesneveu/voxprompt?style=flat-square&color=yellow" alt="Stars"/>
+  <img src="https://img.shields.io/github/stars/charle-com/voxprompt?style=flat-square&color=yellow" alt="Stars"/>
 </p>
 
 <p align="center">
-  <a href="https://github.com/charlesneveu/voxprompt/releases/latest"><strong>Download latest DMG</strong></a> ·
+  <a href="https://github.com/charle-com/voxprompt/releases/latest"><strong>Download latest DMG</strong></a> ·
   <a href="#features">Features</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#faq">FAQ</a> ·
@@ -53,12 +53,12 @@
 
 ### Download the DMG (recommended)
 
-Grab the signed DMG from the [latest release](https://github.com/charlesneveu/voxprompt/releases/latest), open it, drag `VoxPrompt.app` into `/Applications`, and launch.
+Grab the signed DMG from the [latest release](https://github.com/charle-com/voxprompt/releases/latest), open it, drag `VoxPrompt.app` into `/Applications`, and launch.
 
 ### Build from source
 
 ```bash
-git clone https://github.com/charlesneveu/voxprompt.git
+git clone https://github.com/charle-com/voxprompt.git
 cd voxprompt
 ./setup-signing.sh   # one-time: creates a persistent code signing identity
 ./build.sh

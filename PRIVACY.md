@@ -41,7 +41,7 @@ rm ~/Library/Logs/VoxPrompt/voxprompt.log
 
 ## Questions?
 
-Open an issue on [GitHub](https://github.com/charlesneveu/voxprompt/issues).
+Open an issue on [GitHub](https://github.com/charle-com/voxprompt/issues).
 
 ---
 
