@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-05-06
+
+Quality-of-life release: launch VoxPrompt automatically at login.
+
+### Added
+
+- **Launch at login** toggle in Preferences (new "Démarrage" section). Uses the modern `SMAppService.mainApp` API (macOS 13+), no helper bundle required. The UI reflects the live status, including the "Validation requise" hint when macOS is waiting for the user to confirm the login item in Settings > General > Login Items.
+- New `LoginItem.swift` wrapper around `SMAppService` exposing `isEnabled`, `requiresApproval`, and `setEnabled(_:)`.
+
 ## [0.1.1] - 2026-05-06
 
 Reliability release: fixes the auto-paste path that did not consistently insert the transcribed text into the focused app. Tested on macOS 26.4.1 (Tahoe).

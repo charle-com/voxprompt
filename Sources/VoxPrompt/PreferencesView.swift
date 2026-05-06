@@ -10,6 +10,8 @@ struct PreferencesView: View {
     @State private var selectedPasteMode: PasteMode = Settings.shared.pasteMode
     @State private var glossary: String = Settings.shared.glossary
     @State private var accessibilityGranted: Bool = AXIsProcessTrusted()
+    @State private var launchAtLogin: Bool = LoginItem.isEnabled
+    @State private var loginNeedsApproval: Bool = LoginItem.requiresApproval
 
     var body: some View {
         ZStack {
@@ -33,6 +35,9 @@ struct PreferencesView: View {
                     }
                     section(title: "Accessibilité", subtitle: "Pour capter la touche et coller le texte") {
                         accessibilityRow
+                    }
+                    section(title: "Démarrage", subtitle: "Lancer VoxPrompt automatiquement au login") {
+                        launchAtLoginRow
                     }
                     footer
                 }
@@ -236,6 +241,41 @@ struct PreferencesView: View {
         }
     }
 
+    private var launchAtLoginRow: some View {
+        card {
+            HStack(spacing: 10) {
+                SoftDot(color: launchAtLogin ? VPPalette.ok : VPPalette.textFaint, size: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(launchAtLogin ? "Activé" : "Désactivé")
+                        .font(VPType.body(13, weight: .medium))
+                        .foregroundStyle(VPPalette.textPrimary)
+                    if loginNeedsApproval {
+                        Text("Validation requise dans Réglages > Éléments d'ouverture")
+                            .font(VPType.body(11))
+                            .foregroundStyle(VPPalette.work)
+                    } else {
+                        Text(launchAtLogin ? "VoxPrompt se lance au démarrage" : "Lancement manuel uniquement")
+                            .font(VPType.body(11))
+                            .foregroundStyle(VPPalette.textSecond)
+                    }
+                }
+                Spacer()
+                Toggle("", isOn: $launchAtLogin)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(VPPalette.accent)
+                    .onChange(of: launchAtLogin) { _, new in
+                        _ = LoginItem.setEnabled(new)
+                        // Resync : l'OS peut refuser ou exiger une approbation user.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            launchAtLogin = LoginItem.isEnabled
+                            loginNeedsApproval = LoginItem.requiresApproval
+                        }
+                    }
+            }
+        }
+    }
+
     private var accessibilityRow: some View {
         card {
             HStack(spacing: 10) {
@@ -280,7 +320,7 @@ struct PreferencesView: View {
             }
             .buttonStyle(.plain)
             Text("·").foregroundStyle(VPPalette.textFaint)
-            Text("v0.1.1")
+            Text("v0.1.2")
                 .font(VPType.mono(10))
                 .foregroundStyle(VPPalette.textFaint)
         }

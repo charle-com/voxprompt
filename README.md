@@ -172,7 +172,7 @@ No. Audio is written to a temporary WAV file, transcribed, then immediately dele
 
 - [ ] Live waveform driven by microphone input (currently simulated)
 - [ ] Custom hotkey capture (any key combo)
-- [ ] Launch at login
+- [x] Launch at login (shipped in v0.1.2)
 - [ ] Menu bar icon customisation
 - [ ] Streaming transcription (partial results while speaking)
 - [x] Paste mode picker (auto / AppleScript only / Unicode insertion / clipboard only) (shipped in v0.1.1)
