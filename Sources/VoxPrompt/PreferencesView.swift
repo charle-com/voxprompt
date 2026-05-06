@@ -7,6 +7,7 @@ struct PreferencesView: View {
 
     @State private var selectedHotkey: HotkeyBinding = Settings.shared.hotkey
     @State private var selectedModel: String = Settings.shared.modelIdentifier
+    @State private var selectedPasteMode: PasteMode = Settings.shared.pasteMode
     @State private var glossary: String = Settings.shared.glossary
     @State private var accessibilityGranted: Bool = AXIsProcessTrusted()
 
@@ -23,6 +24,9 @@ struct PreferencesView: View {
                     }
                     section(title: "Modèle", subtitle: "Whisper local, Neural Engine") {
                         modelRow
+                    }
+                    section(title: "Collage", subtitle: "Cascade auto : CGEvent puis AppleScript") {
+                        pasteModeRow
                     }
                     section(title: "Glossaire", subtitle: "Noms propres et termes personnels") {
                         glossaryCard
@@ -181,6 +185,31 @@ struct PreferencesView: View {
         }
     }
 
+    private var pasteModeRow: some View {
+        card {
+            HStack {
+                Text(selectedPasteMode.label)
+                    .font(VPType.body(13, weight: .medium))
+                    .foregroundStyle(VPPalette.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer()
+                Picker("", selection: $selectedPasteMode) {
+                    ForEach(PasteMode.allCases, id: \.self) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .tint(VPPalette.accent)
+                .frame(width: 180)
+                .onChange(of: selectedPasteMode) { _, new in
+                    Settings.shared.pasteMode = new
+                }
+            }
+        }
+    }
+
     private var glossaryCard: some View {
         card(padding: 0) {
             ZStack(alignment: .topLeading) {
@@ -251,7 +280,7 @@ struct PreferencesView: View {
             }
             .buttonStyle(.plain)
             Text("·").foregroundStyle(VPPalette.textFaint)
-            Text("v0.1.0")
+            Text("v0.1.1")
                 .font(VPType.mono(10))
                 .foregroundStyle(VPPalette.textFaint)
         }

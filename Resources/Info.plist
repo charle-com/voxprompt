@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>fr.charlesneveu.voxprompt</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.1.1</string>
     <key>CFBundleExecutable</key>
     <string>VoxPrompt</string>
     <key>CFBundlePackageType</key>
@@ -22,6 +22,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>VoxPrompt a besoin du microphone pour enregistrer et transcrire votre voix.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>VoxPrompt utilise les Apple Events pour coller le texte transcrit dans la fenetre active quand le mode auto echoue.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

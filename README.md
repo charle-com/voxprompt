@@ -46,7 +46,7 @@
 - 📚 **Custom glossary** with Levenshtein fuzzy-match for proper nouns, brand names, and technical jargon
 - 🎛️ **Menu bar popover UI** with a refined light theme
 - 🌍 **Multilingual** — French and English auto-detect, or force a specific language
-- 📝 **Clipboard + auto-paste** into the currently focused app
+- 📝 **Reliable auto-paste** into the focused app, with an automatic fallback chain (CGEvent → AppleScript) for apps that reject synthetic keystrokes
 - 🧠 **Swappable Whisper models** — from 39 MB Tiny to 632 MB Large v3 Turbo
 
 ## Install
@@ -175,7 +175,7 @@ No. Audio is written to a temporary WAV file, transcribed, then immediately dele
 - [ ] Launch at login
 - [ ] Menu bar icon customisation
 - [ ] Streaming transcription (partial results while speaking)
-- [ ] Tray toggle between auto-paste and clipboard-only
+- [x] Paste mode picker (auto / AppleScript only / Unicode insertion / clipboard only) (shipped in v0.1.1)
 - [ ] Localised UI (EN / FR / ES / DE)
 
 Contributions welcome — open an issue or PR.

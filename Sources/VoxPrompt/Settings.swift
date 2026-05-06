@@ -1,5 +1,21 @@
 import Foundation
 
+enum PasteMode: String, CaseIterable, Codable, Hashable {
+    case auto             // CGEvent Cmd+V → AppleScript fallback (recommandé)
+    case appleScriptOnly  // AppleScript uniquement (System Events keystroke V)
+    case unicode          // Insertion Unicode directe sans clipboard (mode robuste, casse Terminal)
+    case clipboardOnly    // Aucun paste auto, l'utilisateur fait Cmd+V manuel
+
+    var label: String {
+        switch self {
+        case .auto: return "Auto (recommande)"
+        case .appleScriptOnly: return "AppleScript uniquement"
+        case .unicode: return "Insertion Unicode (robuste)"
+        case .clipboardOnly: return "Presse-papier uniquement"
+        }
+    }
+}
+
 final class Settings {
     static let shared = Settings()
     private let defaults = UserDefaults.standard
@@ -8,6 +24,7 @@ final class Settings {
         static let hotkey = "hotkey.binding"
         static let model = "whisper.model"
         static let language = "whisper.language"
+        static let pasteMode = "paste.mode"
     }
 
     /// Langue forcée pour Whisper (code ISO: "fr", "en", ...). `nil` = auto-detect.
@@ -40,6 +57,16 @@ final class Settings {
     var modelIdentifier: String {
         get { defaults.string(forKey: Keys.model) ?? "openai_whisper-large-v3-v20240930_turbo_632MB" }
         set { defaults.set(newValue, forKey: Keys.model) }
+    }
+
+    /// Stratégie de paste après transcription. Default : auto (cascade CGEvent → AppleScript).
+    var pasteMode: PasteMode {
+        get {
+            guard let raw = defaults.string(forKey: Keys.pasteMode),
+                  let mode = PasteMode(rawValue: raw) else { return .auto }
+            return mode
+        }
+        set { defaults.set(newValue.rawValue, forKey: Keys.pasteMode) }
     }
 }
 

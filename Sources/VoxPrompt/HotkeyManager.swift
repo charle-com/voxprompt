@@ -15,18 +15,24 @@ struct HotkeyBinding: Codable, Equatable, Hashable {
 }
 
 final class HotkeyManager {
-    var onPress: (() -> Void)?
-    var onRelease: (() -> Void)?
+    /// Appelé au keyDown du hotkey. Le `NSRunningApplication?` est l'app frontmost capturée
+    /// au moment du press : c'est la cible où on collera le texte transcrit.
+    var onPress: ((NSRunningApplication?) -> Void)?
+    /// Appelé au keyUp du hotkey. Reçoit la cible capturée au press (peut différer de la
+    /// frontmost actuelle si l'utilisateur a switché d'app pendant qu'il parlait).
+    var onRelease: ((NSRunningApplication?) -> Void)?
 
     private var flagsMonitor: Any?
     private var keyDownMonitor: Any?
     private var keyUpMonitor: Any?
     private var binding: HotkeyBinding = .defaultBinding
     private var isHeld = false
+    private var capturedFrontApp: NSRunningApplication?
 
     func start(binding: HotkeyBinding) {
         self.binding = binding
         self.isHeld = false
+        self.capturedFrontApp = nil
         stop()
 
         switch binding.kind {
@@ -38,10 +44,15 @@ final class HotkeyManager {
                 let pressed = (raw & flagBit) != 0
                 if pressed && !self.isHeld {
                     self.isHeld = true
-                    self.onPress?()
+                    let app = NSWorkspace.shared.frontmostApplication
+                    self.capturedFrontApp = app
+                    VPLog.log("hotkey down (modifier), captured frontApp=\(app?.localizedName ?? "?") pid=\(app?.processIdentifier ?? -1)")
+                    self.onPress?(app)
                 } else if !pressed && self.isHeld {
                     self.isHeld = false
-                    self.onRelease?()
+                    let app = self.capturedFrontApp
+                    self.capturedFrontApp = nil
+                    self.onRelease?(app)
                 }
             }
             flagsMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged, handler: handler)
@@ -53,7 +64,10 @@ final class HotkeyManager {
                 guard event.keyCode == self.binding.keyCode else { return }
                 if !event.isARepeat && !self.isHeld {
                     self.isHeld = true
-                    self.onPress?()
+                    let app = NSWorkspace.shared.frontmostApplication
+                    self.capturedFrontApp = app
+                    VPLog.log("hotkey down (key), captured frontApp=\(app?.localizedName ?? "?") pid=\(app?.processIdentifier ?? -1)")
+                    self.onPress?(app)
                 }
             }
             let up: (NSEvent) -> Void = { [weak self] event in
@@ -61,7 +75,9 @@ final class HotkeyManager {
                 guard event.keyCode == self.binding.keyCode else { return }
                 if self.isHeld {
                     self.isHeld = false
-                    self.onRelease?()
+                    let app = self.capturedFrontApp
+                    self.capturedFrontApp = nil
+                    self.onRelease?(app)
                 }
             }
             keyDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: down)

@@ -83,11 +83,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupHotkey() {
         hotkey = HotkeyManager()
-        hotkey.onPress = { [weak self] in
+        hotkey.onPress = { [weak self] _ in
             Task { @MainActor in self?.startRecording() }
         }
-        hotkey.onRelease = { [weak self] in
-            Task { @MainActor in await self?.stopAndTranscribe() }
+        hotkey.onRelease = { [weak self] target in
+            Task { @MainActor in await self?.stopAndTranscribe(target: target) }
         }
         hotkey.start(binding: Settings.shared.hotkey)
     }
@@ -107,19 +107,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @MainActor private func stopAndTranscribe() async {
+    @MainActor private func stopAndTranscribe(target: NSRunningApplication?) async {
         guard recorder.isRecording else { return }
         let url = recorder.stop()
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-        VPLog.log("stop file=\(url.lastPathComponent) size=\(size) bytes")
+        VPLog.log("stop file=\(url.lastPathComponent) size=\(size) bytes target=\(target?.localizedName ?? "?")")
         hud.show(state: .transcribing)
         do {
             let text = try await transcriber.transcribe(fileURL: url)
             VPLog.log("result: \"\(text)\"")
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                paster.copyAndPaste(trimmed)
                 hud.show(state: .done)
+                await paster.copyAndPaste(trimmed, targetApp: target)
             } else {
                 hud.show(state: .error(message: "Silence"))
             }
