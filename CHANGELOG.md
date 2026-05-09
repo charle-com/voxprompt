@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-05-09
+
+Reliability release: fixes intermittent silent recordings caused by other apps quietly rerouting the system default input device (Microsoft Teams loopback, BlackHole, iPhone Continuity, etc.).
+
+### Fixed
+
+- **Recordings no longer come back empty when another app reroutes the system default input.** VoxPrompt now pins its capture to a specific CoreAudio device by UID (defaults to the built-in microphone) instead of riding on `AVAudioRecorder`'s implicit default-input lookup. When Teams Loopback, BlackHole, an iPhone Continuity microphone or any other input becomes the default mid-session, dictation keeps working on the chosen device.
+- **No more "Sous-titrage Société Radio-Canada" artefacts being pasted on silent input.** Whisper hallucinates training-set artefacts when fed audio below the noise floor. The capture path now computes the file RMS at stop time and short-circuits transcription with an "Aucun son" HUD message when the level is under -50 dBFS, instead of pasting garbage into the focused app.
+
+### Changed
+
+- **`AudioRecorder` migrated from `AVAudioRecorder` to `AVAudioEngine` + `AVAudioConverter`.** The legacy `AVAudioRecorder` API has no way to select an input device on macOS, it always follows the system default. The new engine path explicitly sets `kAudioOutputUnitProperty_CurrentDevice` on the input audio unit before tapping, then resamples to 16 kHz mono PCM 16-bit on the fly via a streaming `AVAudioConverter`. The converter callback returns `.noDataNow` between buffers; `.endOfStream` would terminally close the converter and silently drop every subsequent tap callback after the first one (which would cap every recording at ~100 ms regardless of how long the hotkey is held).
+
+### Added
+
+- **Detailed audio capture logs** under `VOXPROMPT_DEBUG=1`: device name and input format on `rec start`, file size and computed RMS on `rec stop`, explicit `silence detected` line when transcription is short-circuited.
+- **`Settings.preferredInputUID`** (`audio.preferredInputUID` UserDefaults key): string UID of the CoreAudio input device to pin. `nil` falls back to the system default. Defaults to `BuiltInMicrophoneDevice`. A future Preferences UI can expose a device picker that writes this key.
+
 ## [0.1.2] - 2026-05-06
 
 Quality-of-life release: launch VoxPrompt automatically at login.

@@ -111,7 +111,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard recorder.isRecording else { return }
         let url = recorder.stop()
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        let rms = recorder.lastRMS
         VPLog.log("stop file=\(url.lastPathComponent) size=\(size) bytes target=\(target?.localizedName ?? "?")")
+
+        // Whisper hallucinates training-set artefacts ("Sous-titrage Société Radio-Canada", etc.)
+        // when the input is below the noise floor. Skip transcription instead of pasting garbage.
+        if rms < 0.003 {
+            VPLog.log("silence detected rms=\(rms) device=\(recorder.lastDeviceName) — skip transcription")
+            hud.show(state: .error(message: "Aucun son (\(recorder.lastDeviceName))"))
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+
         hud.show(state: .transcribing)
         do {
             let text = try await transcriber.transcribe(fileURL: url)

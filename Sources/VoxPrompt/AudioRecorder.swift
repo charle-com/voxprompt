@@ -1,19 +1,45 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import Combine
 
 final class AudioRecorder {
-    private var recorder: AVAudioRecorder?
+    private let engine = AVAudioEngine()
+    private var file: AVAudioFile?
+    private var converter: AVAudioConverter?
+    private var inputFormat: AVAudioFormat?
     private(set) var isRecording = false
     private(set) var currentURL: URL?
+    private(set) var lastDeviceName: String = "unknown"
+    private(set) var lastRMS: Float = 0
     let levelPublisher = PassthroughSubject<Float, Never>()
-    private var levelTimer: Timer?
 
     func start() throws {
+        guard !isRecording else { return }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("voxprompt-\(UUID().uuidString).wav")
 
-        let settings: [String: Any] = [
+        // Pin input device BEFORE reading inputFormat, otherwise the engine
+        // reports the format of whatever the system default is.
+        if let uid = Settings.shared.preferredInputUID {
+            do {
+                lastDeviceName = try setEngineInputDevice(uid: uid)
+            } catch {
+                VPLog.log("warn: pin device uid=\(uid) failed (\(error.localizedDescription)), falling back to system default")
+                lastDeviceName = Self.currentDefaultDeviceName() ?? "default"
+            }
+        } else {
+            lastDeviceName = Self.currentDefaultDeviceName() ?? "default"
+        }
+
+        let inFormat = engine.inputNode.inputFormat(forBus: 0)
+        guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
+            throw NSError(domain: "VoxPrompt.Recorder", code: 10,
+                          userInfo: [NSLocalizedDescriptionKey: "Format d'entree invalide (\(inFormat.sampleRate)Hz/\(inFormat.channelCount)ch) sur device \(lastDeviceName)"])
+        }
+        inputFormat = inFormat
+
+        let fileSettings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 16000.0,
             AVNumberOfChannelsKey: 1,
@@ -21,43 +47,191 @@ final class AudioRecorder {
             AVLinearPCMIsFloatKey: false,
             AVLinearPCMIsBigEndianKey: false,
         ]
+        let outFile = try AVAudioFile(forWriting: url, settings: fileSettings)
+        file = outFile
 
-        let rec = try AVAudioRecorder(url: url, settings: settings)
-        rec.isMeteringEnabled = true
-        guard rec.prepareToRecord(), rec.record() else {
-            throw NSError(domain: "VoxPrompt.Recorder", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "Impossible de démarrer l'enregistrement"])
+        let processingFormat = outFile.processingFormat
+        guard let conv = AVAudioConverter(from: inFormat, to: processingFormat) else {
+            throw NSError(domain: "VoxPrompt.Recorder", code: 11,
+                          userInfo: [NSLocalizedDescriptionKey: "Converter audio impossible (\(inFormat) -> \(processingFormat))"])
+        }
+        converter = conv
+
+        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { [weak self] buffer, _ in
+            self?.processInputBuffer(buffer)
         }
 
-        recorder = rec
-        currentURL = url
+        engine.prepare()
+        try engine.start()
         isRecording = true
+        currentURL = url
+        VPLog.log("rec start device=\(lastDeviceName) inputFormat=\(Int(inFormat.sampleRate))Hz/\(inFormat.channelCount)ch")
+    }
 
-        levelTimer?.invalidate()
-        levelTimer = Timer.scheduledTimer(withTimeInterval: 1.0/30.0, repeats: true) { [weak self] _ in
-            guard let self, let r = self.recorder else { return }
-            r.updateMeters()
-            let db = r.averagePower(forChannel: 0)
+    private func processInputBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let converter, let file, let inputFormat else { return }
+        let outFormat = file.processingFormat
+        let ratio = outFormat.sampleRate / inputFormat.sampleRate
+        let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 32)
+        guard let outBuf = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCapacity) else { return }
+
+        var error: NSError?
+        var supplied = false
+        // .noDataNow (not .endOfStream) — endOfStream puts the converter in a terminal state
+        // and silently drops every subsequent tap callback, capping the wav at one buffer.
+        let status = converter.convert(to: outBuf, error: &error) { _, ioStatus in
+            if supplied { ioStatus.pointee = .noDataNow; return nil }
+            supplied = true
+            ioStatus.pointee = .haveData
+            return buffer
+        }
+        if status == .error || outBuf.frameLength == 0 { return }
+
+        do { try file.write(from: outBuf) } catch {
+            VPLog.log("write error: \(error)")
+            return
+        }
+
+        if let ch = outBuf.floatChannelData?[0] {
+            let n = Int(outBuf.frameLength)
+            var sum: Float = 0
+            for i in 0..<n { let s = ch[i]; sum += s * s }
+            let rms = sqrtf(sum / Float(max(n, 1)))
+            let db = 20 * log10(max(rms, 1e-6))
             let linear = max(0, min(1, (db + 50) / 50))
-            self.levelPublisher.send(linear)
+            DispatchQueue.main.async { [weak self] in
+                self?.levelPublisher.send(linear)
+            }
         }
     }
 
     @discardableResult
     func stop() -> URL {
         let url = currentURL ?? FileManager.default.temporaryDirectory
-        recorder?.stop()
-        recorder = nil
+        if isRecording {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        file = nil
+        converter = nil
+        inputFormat = nil
         isRecording = false
         currentURL = nil
-        levelTimer?.invalidate()
-        levelTimer = nil
+        lastRMS = Self.fileRMS(at: url)
+        VPLog.log(String(format: "rec stop file=%@ rms=%.4f device=%@", url.lastPathComponent, lastRMS, lastDeviceName))
         return url
     }
 
-    func currentLevel() -> Float {
-        guard let rec = recorder else { return -160 }
-        rec.updateMeters()
-        return rec.averagePower(forChannel: 0)
+    static func fileRMS(at url: URL) -> Float {
+        guard let f = try? AVAudioFile(forReading: url), f.length > 0 else { return 0 }
+        let format = f.processingFormat
+        let chunkFrames: AVAudioFrameCount = 8192
+        var sumSq: Double = 0
+        var sampleCount: Int = 0
+        var remaining = f.length
+        while remaining > 0 {
+            let need = AVAudioFrameCount(min(Int64(chunkFrames), remaining))
+            guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: need) else { break }
+            do { try f.read(into: buf, frameCount: need) } catch { break }
+            let n = Int(buf.frameLength)
+            if n == 0 { break }
+            if let chans = buf.floatChannelData {
+                let chCount = Int(format.channelCount)
+                for c in 0..<chCount {
+                    let p = chans[c]
+                    for i in 0..<n {
+                        let s = Double(p[i])
+                        sumSq += s * s
+                    }
+                }
+                sampleCount += n * chCount
+            }
+            remaining -= Int64(n)
+        }
+        guard sampleCount > 0 else { return 0 }
+        return Float(sqrt(sumSq / Double(sampleCount)))
+    }
+
+    // MARK: CoreAudio device selection
+
+    private func setEngineInputDevice(uid: String) throws -> String {
+        let devices = try Self.listDeviceIDs()
+        var foundID: AudioDeviceID = 0
+        var foundName = "unknown"
+        for d in devices {
+            if Self.stringProperty(device: d, selector: kAudioDevicePropertyDeviceUID) == uid {
+                foundID = d
+                foundName = Self.stringProperty(device: d, selector: kAudioObjectPropertyName) ?? "device"
+                break
+            }
+        }
+        guard foundID != 0 else {
+            throw NSError(domain: "VoxPrompt.Recorder", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey: "Device UID \(uid) not present"])
+        }
+        guard let unit = engine.inputNode.audioUnit else {
+            throw NSError(domain: "VoxPrompt.Recorder", code: 21,
+                          userInfo: [NSLocalizedDescriptionKey: "No audioUnit on inputNode"])
+        }
+        var dev = foundID
+        let setStatus = AudioUnitSetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &dev,
+            UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard setStatus == noErr else {
+            throw NSError(domain: "VoxPrompt.Recorder", code: Int(setStatus),
+                          userInfo: [NSLocalizedDescriptionKey: "AudioUnitSetProperty CurrentDevice failed (\(setStatus))"])
+        }
+        return foundName
+    }
+
+    private static func currentDefaultDeviceName() -> String? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr, 0, nil, &size, &deviceID)
+        guard status == noErr else { return nil }
+        return stringProperty(device: deviceID, selector: kAudioObjectPropertyName)
+    }
+
+    private static func listDeviceIDs() throws -> [AudioDeviceID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr, 0, nil, &size)
+        guard status == noErr else { throw NSError(domain: "VoxPrompt.Recorder", code: Int(status)) }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addr, 0, nil, &size, &ids)
+        guard status == noErr else { throw NSError(domain: "VoxPrompt.Recorder", code: Int(status)) }
+        return ids
+    }
+
+    private static func stringProperty(device: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        var value: CFString? = nil
+        let status = withUnsafeMutablePointer(to: &value) {
+            AudioObjectGetPropertyData(device, &addr, 0, nil, &size, $0)
+        }
+        guard status == noErr else { return nil }
+        return value as String?
     }
 }

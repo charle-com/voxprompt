@@ -25,6 +25,20 @@ final class Settings {
         static let model = "whisper.model"
         static let language = "whisper.language"
         static let pasteMode = "paste.mode"
+        static let preferredInputUID = "audio.preferredInputUID"
+    }
+
+    /// UID CoreAudio du device d'entree a forcer. nil = default systeme.
+    /// Defaut : `BuiltInMicrophoneDevice` pour eviter que le default systeme glisse
+    /// sur Teams Loopback / BlackHole / iPhone Continuity (cause de captures muettes).
+    var preferredInputUID: String? {
+        get {
+            if let v = defaults.object(forKey: Keys.preferredInputUID) as? String {
+                return v.isEmpty ? nil : v
+            }
+            return "BuiltInMicrophoneDevice"
+        }
+        set { defaults.set(newValue ?? "", forKey: Keys.preferredInputUID) }
     }
 
     /// Langue forcée pour Whisper (code ISO: "fr", "en", ...). `nil` = auto-detect.
