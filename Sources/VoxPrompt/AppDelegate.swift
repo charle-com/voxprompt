@@ -21,6 +21,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupHotkey()
         requestMicrophoneAccess()
         Task { await transcriber.warmup() }
+        // Arm CoreAudio off the main thread so the first user hotkey doesn't race the
+        // HAL daemon at boot (cold start would otherwise fail with "Mic KO" and require
+        // a manual app relaunch). 600 ms is enough for TCC + HAL to settle on M-series
+        // Macs in practice.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.recorder.warmup()
+        }
     }
 
     private func setupStatusBar() {
@@ -102,8 +109,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try recorder.start()
         } catch {
-            hud.show(state: .error(message: "Mic KO"))
-            VPLog.log("Recorder error: \(error)")
+            // Distinguish two failure modes: HAL not yet ready right after boot (transient,
+            // retry should work) vs. permission/device actually missing (user-facing).
+            let nsErr = error as NSError
+            let isHALColdStart = nsErr.domain == NSOSStatusErrorDomain
+                || nsErr.domain == "com.apple.coreaudio.avfaudio"
+                || nsErr.domain == "VoxPrompt.Recorder" && nsErr.code == 10
+            let message = isHALColdStart ? "Audio non prêt, réessaye" : "Mic KO"
+            hud.show(state: .error(message: message))
+            VPLog.log("Recorder error: \(error) (domain=\(nsErr.domain) code=\(nsErr.code))")
         }
     }
 

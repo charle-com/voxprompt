@@ -38,14 +38,26 @@ actor Transcriber {
         VPLog.log("audio loaded samples=\(samples.count) (\(samples.count / 16000)s)")
 
         let language = Settings.shared.language
+        // Anti-loop guards. At temperature 0 the greedy decoder has no escape hatch if
+        // it falls into a token-repetition cycle (frequent on macOS 26.x with the Turbo
+        // model). The standard Whisper recipe is to define a temperature fallback ladder
+        // plus compression/logprob thresholds: the decoder retries the segment at the
+        // next temperature whenever the output's compression ratio exceeds 2.4 (typical
+        // signature of repeated tokens) or the average log-probability drops below -1.0.
+        // `withoutTimestamps: true` further reduces loops since the decoder no longer
+        // has to interleave timestamp tokens that can themselves get stuck.
         let options = DecodingOptions(
             verbose: true,
             task: .transcribe,
             language: language,
             temperature: 0.0,
+            temperatureFallbackCount: 3,
             usePrefillPrompt: true,
             skipSpecialTokens: true,
-            withoutTimestamps: false,
+            withoutTimestamps: true,
+            compressionRatioThreshold: 2.4,
+            logProbThreshold: -1.0,
+            noSpeechThreshold: 0.6,
             chunkingStrategy: .vad
         )
         VPLog.log("calling pipe.transcribe (detached) lang=\(language ?? "auto")")

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-05-19
+
+Reliability release: fixes two issues surfaced after upgrading to macOS 26.5. First, the very first dictation right after a Mac boot would frequently fail with a generic "Mic KO" HUD until the app was relaunched. Second, the Whisper decoder could enter an infinite token-repetition loop on the Turbo model, leaving the HUD spinning forever.
+
+### Fixed
+
+- **Cold-start "Mic KO" right after boot.** At boot, the CoreAudio HAL daemon and TCC subsystem take a moment to settle. The first `AVAudioEngine.start()` after launch-at-login would race that warmup window and fail with an opaque `OSStatus`, leaving the engine in a broken state until the app was relaunched manually. VoxPrompt now arms the input audio unit off the main thread ~600 ms after launch (one start/stop cycle through `engine.prepare()` + `engine.start()` + `engine.stop()`), so the first user hotkey runs against an already-warm unit. If the start still throws, the engine is rebuilt and the call is retried once after a 250 ms delay.
+- **Whisper decoder loops on Turbo (macOS 26.x).** At `temperature: 0.0` with `withoutTimestamps: false`, the greedy decoder has no escape hatch when it falls into a token-repetition cycle — the HUD then stays in "transcribing" forever. The `DecodingOptions` now follow the standard Whisper anti-loop recipe: `withoutTimestamps: true`, explicit `temperatureFallbackCount: 3`, `compressionRatioThreshold: 2.4`, `logProbThreshold: -1.0`, `noSpeechThreshold: 0.6`. The decoder now retries the segment at a higher temperature whenever the output compresses too well (signature of repeated tokens) or the average log-probability collapses.
+
+### Changed
+
+- **HUD error message disambiguation.** The generic "Mic KO" was previously shown for every recording-start failure, including transient HAL-not-ready conditions at boot. The HUD now distinguishes the two: "Audio non prêt, réessaye" for cold-start `OSStatus` failures (the user should just hold the hotkey again), versus "Mic KO" only for permission/device-missing failures (the user needs to act).
+
+### Internals
+
+- `AudioRecorder.engine` is now `var` (was `let`), so it can be replaced when a cold-start failure puts the input unit in an undefined state. `rebuildEngine()` drops the tap, stops the engine, and instantiates a fresh `AVAudioEngine()`; `start()` calls it in its `catch` branch before retrying.
+- New `AudioRecorder.warmup()` shared by the launch-time priming and by manual recovery paths. `isWarm` tracks whether the engine has been started successfully at least once.
+
 ## [0.1.3] - 2026-05-09
 
 Reliability release: fixes intermittent silent recordings caused by other apps quietly rerouting the system default input device (Microsoft Teams loopback, BlackHole, iPhone Continuity, etc.).

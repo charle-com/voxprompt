@@ -9,9 +9,9 @@
     <key>CFBundleIdentifier</key>
     <string>fr.charlesneveu.voxprompt</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>5</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.2</string>
+    <string>0.1.4</string>
     <key>CFBundleExecutable</key>
     <string>VoxPrompt</string>
     <key>CFBundlePackageType</key>

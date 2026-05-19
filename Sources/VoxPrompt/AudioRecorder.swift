@@ -4,33 +4,59 @@ import AudioToolbox
 import Combine
 
 final class AudioRecorder {
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var file: AVAudioFile?
     private var converter: AVAudioConverter?
     private var inputFormat: AVAudioFormat?
     private(set) var isRecording = false
+    private(set) var isWarm = false
     private(set) var currentURL: URL?
     private(set) var lastDeviceName: String = "unknown"
     private(set) var lastRMS: Float = 0
     let levelPublisher = PassthroughSubject<Float, Never>()
 
+    /// Force CoreAudio HAL + AVAudioEngine input unit to fully initialize. At boot, the
+    /// HAL daemon takes a moment to settle and the very first `engine.start()` can fail
+    /// with an opaque OSStatus, leaving the engine in a broken state until the app is
+    /// relaunched. Calling this once at launch (off the main thread) eliminates that
+    /// window: the first user-facing `start()` runs against an already-armed unit.
+    func warmup() {
+        guard !isWarm, !isRecording else { return }
+        do {
+            try pinDeviceIfRequested()
+            let inFormat = engine.inputNode.inputFormat(forBus: 0)
+            guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
+                VPLog.log("warmup: skipped, input format invalid (\(inFormat.sampleRate)Hz/\(inFormat.channelCount)ch)")
+                return
+            }
+            engine.prepare()
+            try engine.start()
+            engine.stop()
+            isWarm = true
+            VPLog.log("audio warmup OK device=\(lastDeviceName) inputFormat=\(Int(inFormat.sampleRate))Hz/\(inFormat.channelCount)ch")
+        } catch {
+            VPLog.log("audio warmup failed: \(error.localizedDescription) — first start() will retry")
+            rebuildEngine()
+        }
+    }
+
     func start() throws {
         guard !isRecording else { return }
+        do {
+            try startInternal()
+        } catch {
+            VPLog.log("start failed once: \(error.localizedDescription) — rebuilding engine and retrying")
+            rebuildEngine()
+            Thread.sleep(forTimeInterval: 0.25)
+            try startInternal()
+        }
+    }
+
+    private func startInternal() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("voxprompt-\(UUID().uuidString).wav")
 
-        // Pin input device BEFORE reading inputFormat, otherwise the engine
-        // reports the format of whatever the system default is.
-        if let uid = Settings.shared.preferredInputUID {
-            do {
-                lastDeviceName = try setEngineInputDevice(uid: uid)
-            } catch {
-                VPLog.log("warn: pin device uid=\(uid) failed (\(error.localizedDescription)), falling back to system default")
-                lastDeviceName = Self.currentDefaultDeviceName() ?? "default"
-            }
-        } else {
-            lastDeviceName = Self.currentDefaultDeviceName() ?? "default"
-        }
+        try pinDeviceIfRequested()
 
         let inFormat = engine.inputNode.inputFormat(forBus: 0)
         guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
@@ -64,8 +90,39 @@ final class AudioRecorder {
         engine.prepare()
         try engine.start()
         isRecording = true
+        isWarm = true
         currentURL = url
         VPLog.log("rec start device=\(lastDeviceName) inputFormat=\(Int(inFormat.sampleRate))Hz/\(inFormat.channelCount)ch")
+    }
+
+    private func pinDeviceIfRequested() throws {
+        if let uid = Settings.shared.preferredInputUID {
+            do {
+                lastDeviceName = try setEngineInputDevice(uid: uid)
+            } catch {
+                VPLog.log("warn: pin device uid=\(uid) failed (\(error.localizedDescription)), falling back to system default")
+                lastDeviceName = Self.currentDefaultDeviceName() ?? "default"
+            }
+        } else {
+            lastDeviceName = Self.currentDefaultDeviceName() ?? "default"
+        }
+    }
+
+    private func rebuildEngine() {
+        // AVAudioEngine cannot be restarted reliably once start() has thrown; the input
+        // unit ends up in an undefined state. Replacing the whole engine is the only
+        // documented path to recover, per Apple Audio forum threads on cold start failures.
+        if isRecording {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        engine = AVAudioEngine()
+        file = nil
+        converter = nil
+        inputFormat = nil
+        isRecording = false
+        isWarm = false
+        currentURL = nil
     }
 
     private func processInputBuffer(_ buffer: AVAudioPCMBuffer) {
