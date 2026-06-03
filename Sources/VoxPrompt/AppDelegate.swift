@@ -148,6 +148,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 hud.show(state: .error(message: "Silence"))
             }
+        } catch let e as Transcriber.TranscriberError {
+            if case .timeout = e {
+                hud.show(state: .error(message: "Trop long, réessaye"))
+            } else {
+                hud.show(state: .error(message: "Transcription KO"))
+            }
+            VPLog.log("Transcriber error: \(e)")
         } catch {
             hud.show(state: .error(message: "Transcription KO"))
             VPLog.log("Transcriber error: \(error)")

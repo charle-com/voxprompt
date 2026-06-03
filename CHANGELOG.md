@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-06-03
+
+Reliability release: the Whisper token-repetition loop fixed in 0.1.4 resurfaced after upgrading to macOS 26.5.1. The `DecodingOptions` anti-loop recipe (temperature fallback, compression/logprob thresholds) tuned for 26.5 no longer catches every case on 26.5.1, and there was no hard backstop: once the decoder looped internally, `pipe.transcribe` never returned and the HUD spun forever. This release adds three independent, version-agnostic safety nets so the app can never get stuck again.
+
+### Fixed
+
+- **Decoder repetition loop leaving the HUD stuck on macOS 26.5.1.** The single-layer WhisperKit recipe is now backed by defense in depth:
+  1. **In-callback loop detection** (`isRepetitionLoop`). On every decode callback, the running text is scanned for a 1-to-6-word pattern repeated 4+ times consecutively at the tail (the signature of a runaway greedy decode). When detected, the callback returns `false`, cutting Whisper off at the source within a few hundred milliseconds instead of waiting for the segment to finish.
+  2. **Watchdog timeout.** The transcription now runs inside a `withThrowingTaskGroup` racing the decode against a bounded deadline (`max(20s, audioSeconds * 5)`). If the decoder freezes *before* emitting an actionable callback, the watchdog throws `TranscriberError.timeout`, cancels the detached decode task, and the HUD recovers with "Trop long, réessaye" instead of spinning indefinitely.
+  3. **Final-text repetition collapse** (`collapseRepetitions`). Any residual run of a 1-to-6-word pattern repeated 3+ times is collapsed to a single occurrence, scanning small patterns first and advancing word-by-word to stay phase-aligned. A deliberate doubling ("très très bien") is preserved since it only triggers at three repeats.
+
+### Changed
+
+- **HUD error disambiguation for transcription failures.** A transcription that hits the watchdog now shows "Trop long, réessaye" (transient, just retry) instead of the generic "Transcription KO" (reserved for genuine decode errors).
+
 ## [0.1.4] - 2026-05-19
 
 Reliability release: fixes two issues surfaced after upgrading to macOS 26.5. First, the very first dictation right after a Mac boot would frequently fail with a generic "Mic KO" HUD until the app was relaunched. Second, the Whisper decoder could enter an infinite token-repetition loop on the Turbo model, leaving the HUD spinning forever.
