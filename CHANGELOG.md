@@ -7,18 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.5] - 2026-06-03
 
-Reliability release: the Whisper token-repetition loop fixed in 0.1.4 resurfaced after upgrading to macOS 26.5.1. The `DecodingOptions` anti-loop recipe (temperature fallback, compression/logprob thresholds) tuned for 26.5 no longer catches every case on 26.5.1, and there was no hard backstop: once the decoder looped internally, `pipe.transcribe` never returned and the HUD spun forever. This release adds three independent, version-agnostic safety nets so the app can never get stuck again.
+Reliability release: after upgrading to macOS 26.5.1, dictation would hang forever ("transcription à l'infini") — the HUD stayed in "transcribing" and never returned. Root-caused by isolating the WhisperKit compute backends on the machine: with the Turbo model on macOS 26.5.1, CoreML inference **deadlocks on both the Apple Neural Engine and the GPU/Metal** (decoder frozen, 30s+ with zero tokens emitted), and only the **CPU** backend decodes correctly. The 0.1.4 anti-loop `DecodingOptions` recipe couldn't help because the decoder never even reached the token-generation stage. This release moves inference to CPU and adds independent safety nets.
 
 ### Fixed
 
-- **Decoder repetition loop leaving the HUD stuck on macOS 26.5.1.** The single-layer WhisperKit recipe is now backed by defense in depth:
-  1. **In-callback loop detection** (`isRepetitionLoop`). On every decode callback, the running text is scanned for a 1-to-6-word pattern repeated 4+ times consecutively at the tail (the signature of a runaway greedy decode). When detected, the callback returns `false`, cutting Whisper off at the source within a few hundred milliseconds instead of waiting for the segment to finish.
-  2. **Watchdog timeout.** The transcription now runs inside a `withThrowingTaskGroup` racing the decode against a bounded deadline (`max(20s, audioSeconds * 5)`). If the decoder freezes *before* emitting an actionable callback, the watchdog throws `TranscriberError.timeout`, cancels the detached decode task, and the HUD recovers with "Trop long, réessaye" instead of spinning indefinitely.
-  3. **Final-text repetition collapse** (`collapseRepetitions`). Any residual run of a 1-to-6-word pattern repeated 3+ times is collapsed to a single occurrence, scanning small patterns first and advancing word-by-word to stay phase-aligned. A deliberate doubling ("très très bien") is preserved since it only triggers at three repeats.
+- **Dictation hanging forever on macOS 26.5.1 (root cause).** WhisperKit defaults the audio encoder and text decoder to `.cpuAndNeuralEngine`; both the ANE and the GPU (`.cpuAndGPU`) deadlock natively on this OS for the Turbo model. The pipeline now pins every stage (`melCompute`, `audioEncoderCompute`, `textDecoderCompute`, `prefillCompute`) to `.cpuOnly`, the only backend verified to decode. Measured steady-state latency on CPU is ~2s for a short dictation — perfectly usable.
+- **First-dictation lag.** CPU inference pays a one-time CoreML graph-compilation cost (~8s) on the first decode. The launch warmup now decodes 2s of low-amplitude white noise (`sampleLength: 4`, VAD off) to force that compilation up front, so the user's first real dictation is already fast (~2s) instead of stalling.
+
+### Added — defense in depth (independent of the OS bug)
+
+- **Watchdog timeout.** Transcription runs under `runWithTimeout` (a `withCheckedThrowingContinuation` racing the decode against `max(20s, audioSeconds × 5)`). If a decode ever freezes again, the continuation is resolved by the timeout, the frozen task is abandoned, and the HUD recovers with "Trop long, réessaye" instead of spinning forever. Unlike a `TaskGroup`, this does not re-block waiting on the frozen child.
+- **In-callback loop detection** (`isRepetitionLoop`) and **final-text repetition collapse** (`collapseRepetitions`) for the distinct token-repetition failure mode: a 1-to-6-word pattern repeating is cut at the source mid-decode and/or collapsed in the final text, while a deliberate doubling ("très très bien") is preserved.
 
 ### Changed
 
-- **HUD error disambiguation for transcription failures.** A transcription that hits the watchdog now shows "Trop long, réessaye" (transient, just retry) instead of the generic "Transcription KO" (reserved for genuine decode errors).
+- **HUD error disambiguation.** A transcription that hits the watchdog shows "Trop long, réessaye" (transient, just retry) instead of the generic "Transcription KO".
 
 ## [0.1.4] - 2026-05-19
 

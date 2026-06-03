@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreML
 import WhisperKit
 
 actor Transcriber {
@@ -11,7 +12,21 @@ actor Transcriber {
         if let existing = loading { return try await existing.value }
         let task = Task { () throws -> WhisperKit in
             VPLog.log("pipeline init start, model=\(Settings.shared.modelIdentifier)")
-            let config = WhisperKitConfig(model: Settings.shared.modelIdentifier)
+            // Tout le pipeline sur CPU. Sur macOS 26.5.1, l'inférence CoreML du modèle Turbo
+            // se fige (deadlock natif, décodeur gelé avant le moindre token) à la fois sur
+            // l'Apple Neural Engine (`.cpuAndNeuralEngine`, le défaut WhisperKit) ET sur le
+            // GPU/Metal (`.cpuAndGPU`). Vérifié empiriquement : GPU et ANE timeout à 30s, seul
+            // `.cpuOnly` décode correctement. C'est la correction de fond du blocage
+            // "transcription à l'infini". Le surcoût CPU est un coût de compilation au premier
+            // décodage (~8s), absorbé par le warmup ci-dessous ; en régime établi une dictée
+            // courte se transcrit en ~2s, ce qui est tout à fait acceptable.
+            let compute = ModelComputeOptions(
+                melCompute: .cpuOnly,
+                audioEncoderCompute: .cpuOnly,
+                textDecoderCompute: .cpuOnly,
+                prefillCompute: .cpuOnly
+            )
+            let config = WhisperKitConfig(model: Settings.shared.modelIdentifier, computeOptions: compute)
             let kit = try await WhisperKit(config)
             VPLog.log("pipeline init done")
             return kit
@@ -24,8 +39,32 @@ actor Transcriber {
     }
 
     func warmup() async {
-        do { _ = try await ensurePipeline() }
-        catch { VPLog.log("warmup error: \(error)") }
+        do {
+            let pipe = try await ensurePipeline()
+            // Précompile le graphe CoreML du décodeur (coûteux uniquement au 1er décodage,
+            // ~8s sur CPU) pour que la PREMIÈRE vraie dictée soit déjà rapide (~2s). On
+            // décode 2s de bruit blanc faible, VAD désactivé et noSpeechThreshold à 1.0 pour
+            // forcer le décodeur à émettre au moins un token. Le résultat est jeté.
+            var noise = [Float](repeating: 0, count: 16_000 * 2)
+            var seed: UInt64 = 0x9E3779B97F4A7C15
+            for i in 0..<noise.count {
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                noise[i] = (Float(seed >> 40) / Float(1 << 24) - 0.5) * 0.1
+            }
+            // sampleLength: 4 borne le décodage à quelques tokens : assez pour compiler le
+            // graphe CoreML du décodeur, sans le laisser halluciner des centaines de tokens
+            // sur du bruit (ce qui prendrait 30s+ et retarderait la première vraie dictée).
+            let warmOptions = DecodingOptions(
+                verbose: false, task: .transcribe, language: Settings.shared.language,
+                temperature: 0.0, sampleLength: 4, usePrefillPrompt: true, skipSpecialTokens: true,
+                withoutTimestamps: true, noSpeechThreshold: 1.0, chunkingStrategy: ChunkingStrategy.none
+            )
+            let t = Date()
+            _ = try? await pipe.transcribe(audioArray: noise, decodeOptions: warmOptions, callback: { _ in nil })
+            VPLog.log(String(format: "decoder warmup done in %.2fs", Date().timeIntervalSince(t)))
+        } catch {
+            VPLog.log("warmup error: \(error)")
+        }
     }
 
     enum TranscriberError: Error, CustomStringConvertible {
@@ -73,48 +112,32 @@ actor Transcriber {
             noSpeechThreshold: 0.6,
             chunkingStrategy: .vad
         )
-        VPLog.log("calling pipe.transcribe (detached) lang=\(language ?? "auto")")
+        VPLog.log("calling pipe.transcribe lang=\(language ?? "auto")")
         let t1 = Date()
 
-        // Défense en profondeur contre les boucles de répétition du décodeur Turbo, qui
-        // sont réapparues sur macOS 26.5.1 malgré la recette WhisperKit ci-dessus. Trois
-        // filets indépendants, du plus précis au plus brutal :
-        //   1. Détection de boucle DANS le callback : dès qu'un n-gramme se répète
-        //      anormalement pendant le décodage, on renvoie `false` pour couper Whisper
-        //      à la source en quelques centaines de ms, sans attendre la fin.
-        //   2. Watchdog timeout : si le décodeur se fige AVANT d'émettre un callback
-        //      exploitable, on rend la main au bout d'un délai borné (proportionnel à la
-        //      durée audio) plutôt que de laisser le HUD tourner à l'infini.
-        //   3. collapseRepetitions sur le texte final, pour nettoyer tout résidu de
-        //      répétition ayant survécu aux deux premiers filets.
+        // Défense en profondeur, en plus du backend CPU choisi à l'init :
+        //   1. Détection de boucle DANS le callback : si le décodeur Turbo se met malgré
+        //      tout à répéter un n-gramme, on renvoie `false` pour le couper à la source.
+        //   2. Watchdog timeout : si le décodage ne rend pas la main dans un délai borné
+        //      (deadlock natif qui ne répond ni à l'annulation ni au callback), on rend la
+        //      main au HUD et on abandonne la tâche figée, au lieu de tourner à l'infini.
+        //   3. collapseRepetitions sur le texte final, pour nettoyer tout résidu.
         let timeoutSeconds = max(20.0, audioSeconds * 5.0)
-
-        let transcribeTask = Task.detached(priority: .userInitiated) { () async throws -> [TranscriptionResult] in
-            try await pipe.transcribe(audioArray: samples, decodeOptions: options, callback: { progress in
-                if Task.isCancelled { return false }               // coupé par le watchdog
-                if Self.isRepetitionLoop(progress.text) {
-                    VPLog.log("repetition loop detected mid-decode — aborting")
-                    return false                                    // filet 1 : coupe à la source
-                }
-                VPLog.log("progress: \(progress.text.suffix(80))")
-                return nil
-            })
-        }
 
         let results: [TranscriptionResult]
         do {
-            results = try await withThrowingTaskGroup(of: [TranscriptionResult].self) { group in
-                group.addTask { try await transcribeTask.value }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                    throw TranscriberError.timeout(seconds: timeoutSeconds)
-                }
-                guard let first = try await group.next() else { return [] }
-                group.cancelAll()
-                return first
+            results = try await Self.runWithTimeout(seconds: timeoutSeconds) {
+                try await pipe.transcribe(audioArray: samples, decodeOptions: options, callback: { progress in
+                    if Task.isCancelled { return false }            // coupé par le watchdog
+                    if Self.isRepetitionLoop(progress.text) {
+                        VPLog.log("repetition loop detected mid-decode — aborting")
+                        return false                                 // filet 1 : coupe à la source
+                    }
+                    VPLog.log("progress: \(progress.text.suffix(80))")
+                    return nil
+                })
             }
         } catch {
-            transcribeTask.cancel()                                 // filet 2 : libère le décodeur
             VPLog.log("transcribe aborted: \(error)")
             throw error
         }
@@ -130,6 +153,38 @@ actor Transcriber {
             VPLog.log("glossary applied: \"\(deduped.prefix(60))\" → \"\(corrected.prefix(60))\"")
         }
         return corrected
+    }
+
+    /// Exécute `work` avec un délai maximum. À la différence d'un `withThrowingTaskGroup`,
+    /// qui attendrait la fin de toutes ses tâches enfants à la sortie (et resterait donc
+    /// lui-même bloqué si le décodage est figé sur un deadlock natif insensible à
+    /// l'annulation), on résout ici la continuation dès le premier des deux événements :
+    /// fin du travail OU expiration du délai. En cas de timeout, la tâche de travail est
+    /// annulée puis simplement abandonnée en arrière-plan ; `transcribe()` rend la main et
+    /// le HUD se débloque au lieu de tourner à l'infini. Le garde `ResumeOnce` empêche tout
+    /// double `resume` de la continuation (qui ferait crasher l'app).
+    static func runWithTimeout<T: Sendable>(
+        seconds: Double,
+        _ work: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let gate = ResumeOnce()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
+            let workTask = Task.detached(priority: .userInitiated) {
+                do {
+                    let value = try await work()
+                    if await gate.claim() { cont.resume(returning: value) }
+                } catch {
+                    if await gate.claim() { cont.resume(throwing: error) }
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                if await gate.claim() {
+                    workTask.cancel()
+                    cont.resume(throwing: TranscriberError.timeout(seconds: seconds))
+                }
+            }
+        }
     }
 
     /// Détecte une boucle de répétition du décodeur : un même motif de 1 à 6 mots répété
@@ -322,5 +377,17 @@ actor Transcriber {
             throw NSError(domain: "VoxPrompt.Audio", code: 3)
         }
         return Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+    }
+}
+
+/// Garde à usage unique : `claim()` ne renvoie `true` qu'une seule fois, pour les autres
+/// appels `false`. Permet à deux tâches concurrentes (le travail et le timeout) de se
+/// disputer le droit de résoudre une `CheckedContinuation` sans jamais la résoudre deux fois.
+actor ResumeOnce {
+    private var claimed = false
+    func claim() -> Bool {
+        if claimed { return false }
+        claimed = true
+        return true
     }
 }
