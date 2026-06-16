@@ -92,6 +92,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey = HotkeyManager()
         hotkey.onPress = { [weak self] _ in
             Task { @MainActor in self?.startRecording() }
+            // Réchauffe le moteur pendant que l'utilisateur parle (no-op s'il est déjà chaud) :
+            // au relâchement, le décodeur est déjà prêt, ce qui supprime le délai à froid.
+            Task { @MainActor in await self?.transcriber.keepWarm() }
         }
         hotkey.onRelease = { [weak self] target in
             Task { @MainActor in await self?.stopAndTranscribe(target: target) }

@@ -6,65 +6,222 @@ import WhisperKit
 actor Transcriber {
     private var pipeline: WhisperKit?
     private var loading: Task<WhisperKit, Error>?
+    private var activeProfile: ComputeProfile?
+    /// Date du dernier décodage réel ou warmup, pour décider si le moteur est "froid".
+    private var lastUsed: Date = .distantPast
+
+    private enum Keys {
+        static let computeProfile = "whisper.computeProfile"
+        static let computeProfileOSBuild = "whisper.computeProfileOSBuild"
+    }
+
+    // MARK: - Backend compute auto-adaptatif
+
+    /// Une combinaison d'unités de calcul CoreML par étage du pipeline Whisper.
+    struct ComputeProfile: Equatable {
+        let id: String
+        let label: String
+        let mel: MLComputeUnits
+        let audioEncoder: MLComputeUnits
+        let textDecoder: MLComputeUnits
+        let prefill: MLComputeUnits
+        var options: ModelComputeOptions {
+            ModelComputeOptions(
+                melCompute: mel,
+                audioEncoderCompute: audioEncoder,
+                textDecoderCompute: textDecoder,
+                prefillCompute: prefill
+            )
+        }
+    }
+
+    /// Profils candidats, du plus rapide au plus sûr.
+    ///
+    /// Contexte : sur macOS 26.5.x, l'inférence CoreML du DÉCODEUR Whisper se fige
+    /// (deadlock natif : décodeur gelé avant le moindre token) à la fois sur l'Apple
+    /// Neural Engine et sur le GPU/Metal. L'ENCODEUR audio, lui, n'est pas touché. Or
+    /// c'est l'encodeur le composant lourd (≈85 % du temps de transcription sur CPU,
+    /// mesuré : ~6 s pour 12 s d'audio, le décodage ne prenant que ~1 s). On remet donc
+    /// l'encodeur sur le matériel rapide et on garde le décodeur (et le prefill) sur CPU.
+    /// Si même l'encodeur déraille, on retombe sur GPU puis sur tout-CPU.
+    ///
+    /// Le profil retenu est mémorisé PAR BUILD macOS (`kern.osversion`). Le jour où Apple
+    /// corrige l'inférence (nouveau build), le cache est invalidé, on re-teste depuis le
+    /// plus rapide et l'app reprend automatiquement le plein régime, sans intervention.
+    static let profiles: [ComputeProfile] = [
+        ComputeProfile(id: "ane-encoder", label: "encodeur Neural Engine + décodeur CPU",
+                       mel: .cpuOnly, audioEncoder: .cpuAndNeuralEngine, textDecoder: .cpuOnly, prefill: .cpuOnly),
+        ComputeProfile(id: "gpu-encoder", label: "encodeur GPU + décodeur CPU",
+                       mel: .cpuOnly, audioEncoder: .cpuAndGPU, textDecoder: .cpuOnly, prefill: .cpuOnly),
+        ComputeProfile(id: "cpu-only", label: "tout CPU (filet de sécurité)",
+                       mel: .cpuOnly, audioEncoder: .cpuOnly, textDecoder: .cpuOnly, prefill: .cpuOnly),
+    ]
+
+    private static func profile(byID id: String?) -> ComputeProfile? {
+        guard let id else { return nil }
+        return profiles.first { $0.id == id }
+    }
+
+    /// Profil déjà validé POUR CE BUILD macOS, sinon nil (il faudra le déterminer).
+    private static func cachedProfile() -> ComputeProfile? {
+        let d = UserDefaults.standard
+        guard d.string(forKey: Keys.computeProfileOSBuild) == osBuild() else { return nil }
+        return profile(byID: d.string(forKey: Keys.computeProfile))
+    }
+
+    private static func persist(_ p: ComputeProfile) {
+        let d = UserDefaults.standard
+        d.set(p.id, forKey: Keys.computeProfile)
+        d.set(osBuild(), forKey: Keys.computeProfileOSBuild)
+    }
+
+    /// Build macOS courant (ex "25F80"). C'est ce qui change quand Apple publie un correctif,
+    /// donc la bonne clé pour re-tester le matériel après une mise à jour système.
+    private static func osBuild() -> String {
+        var size = 0
+        if sysctlbyname("kern.osversion", nil, &size, nil, 0) != 0 || size == 0 { return "unknown" }
+        var buf = [CChar](repeating: 0, count: size)
+        if sysctlbyname("kern.osversion", &buf, &size, nil, 0) != 0 { return "unknown" }
+        return String(cString: buf)
+    }
+
+    // MARK: - Cycle de vie du pipeline
+
+    private func makePipeline(profile: ComputeProfile) async throws -> WhisperKit {
+        VPLog.log("pipeline init start, model=\(Settings.shared.modelIdentifier), compute=\(profile.id)")
+        let config = WhisperKitConfig(model: Settings.shared.modelIdentifier, computeOptions: profile.options)
+        let kit = try await WhisperKit(config)
+        VPLog.log("pipeline init done (compute=\(profile.id))")
+        return kit
+    }
 
     private func ensurePipeline() async throws -> WhisperKit {
         if let p = pipeline { return p }
         if let existing = loading { return try await existing.value }
-        let task = Task { () throws -> WhisperKit in
-            VPLog.log("pipeline init start, model=\(Settings.shared.modelIdentifier)")
-            // Tout le pipeline sur CPU. Sur macOS 26.5.1, l'inférence CoreML du modèle Turbo
-            // se fige (deadlock natif, décodeur gelé avant le moindre token) à la fois sur
-            // l'Apple Neural Engine (`.cpuAndNeuralEngine`, le défaut WhisperKit) ET sur le
-            // GPU/Metal (`.cpuAndGPU`). Vérifié empiriquement : GPU et ANE timeout à 30s, seul
-            // `.cpuOnly` décode correctement. C'est la correction de fond du blocage
-            // "transcription à l'infini". Le surcoût CPU est un coût de compilation au premier
-            // décodage (~8s), absorbé par le warmup ci-dessous ; en régime établi une dictée
-            // courte se transcrit en ~2s, ce qui est tout à fait acceptable.
-            let compute = ModelComputeOptions(
-                melCompute: .cpuOnly,
-                audioEncoderCompute: .cpuOnly,
-                textDecoderCompute: .cpuOnly,
-                prefillCompute: .cpuOnly
-            )
-            let config = WhisperKitConfig(model: Settings.shared.modelIdentifier, computeOptions: compute)
-            let kit = try await WhisperKit(config)
-            VPLog.log("pipeline init done")
-            return kit
-        }
+        let profile = activeProfile ?? Self.cachedProfile() ?? Self.profiles[0]
+        let task = Task { try await self.makePipeline(profile: profile) }
         loading = task
-        let p = try await task.value
-        pipeline = p
-        loading = nil
-        return p
+        do {
+            let p = try await task.value
+            pipeline = p
+            activeProfile = profile
+            loading = nil
+            return p
+        } catch {
+            loading = nil
+            throw error
+        }
     }
 
+    /// Appelé une fois au démarrage. Détermine (ou relit) le backend compute le plus rapide
+    /// qui décode sans se figer, charge le pipeline et précompile le décodeur. Tourne en
+    /// arrière-plan, donc n'impacte pas le temps de lancement perçu.
     func warmup() async {
-        do {
-            let pipe = try await ensurePipeline()
-            // Précompile le graphe CoreML du décodeur (coûteux uniquement au 1er décodage,
-            // ~8s sur CPU) pour que la PREMIÈRE vraie dictée soit déjà rapide (~2s). On
-            // décode 2s de bruit blanc faible, VAD désactivé et noSpeechThreshold à 1.0 pour
-            // forcer le décodeur à émettre au moins un token. Le résultat est jeté.
-            var noise = [Float](repeating: 0, count: 16_000 * 2)
-            var seed: UInt64 = 0x9E3779B97F4A7C15
-            for i in 0..<noise.count {
-                seed = seed &* 6364136223846793005 &+ 1442695040888963407
-                noise[i] = (Float(seed >> 40) / Float(1 << 24) - 0.5) * 0.1
+        // 1) Profil déjà validé pour ce build macOS : on l'utilise sans re-tester.
+        if let cached = Self.cachedProfile() {
+            VPLog.log("compute profile (cache) = \(cached.id) [\(cached.label)]")
+            await loadAndWarm(cached)
+            return
+        }
+        // 2) Sinon, on sonde du plus rapide au plus sûr et on mémorise le premier sain.
+        VPLog.log("probing compute profiles for macOS build \(Self.osBuild())…")
+        for p in Self.profiles {
+            VPLog.log("probing \(p.id)…")
+            if await probe(p) {
+                Self.persist(p)
+                VPLog.log("compute profile selected = \(p.id) [\(p.label)]")
+                return
             }
-            // sampleLength: 4 borne le décodage à quelques tokens : assez pour compiler le
-            // graphe CoreML du décodeur, sans le laisser halluciner des centaines de tokens
-            // sur du bruit (ce qui prendrait 30s+ et retarderait la première vraie dictée).
-            let warmOptions = DecodingOptions(
-                verbose: false, task: .transcribe, language: Settings.shared.language,
-                temperature: 0.0, sampleLength: 4, usePrefillPrompt: true, skipSpecialTokens: true,
-                withoutTimestamps: true, noSpeechThreshold: 1.0, chunkingStrategy: ChunkingStrategy.none
-            )
+            VPLog.log("\(p.id) KO (figé/timeout) — profil suivant")
+            pipeline = nil
+            loading = nil
+            activeProfile = nil
+        }
+        VPLog.log("aucun profil n'a décodé — fallback CPU sans cache")
+        await loadAndWarm(Self.profiles.last!)
+    }
+
+    /// Tente un profil : charge le pipeline et décode un court bruit sous watchdog. Renvoie
+    /// true si le décodage rend la main dans le délai (profil sain), false s'il se fige.
+    /// Délai généreux (60 s) : un deadlock ne rend JAMAIS la main, tandis qu'une première
+    /// compilation ANE légitime peut être longue ; on ne veut pas la confondre avec un blocage.
+    private func probe(_ p: ComputeProfile) async -> Bool {
+        do {
+            let kit = try await makePipeline(profile: p)
             let t = Date()
-            _ = try? await pipe.transcribe(audioArray: noise, decodeOptions: warmOptions, callback: { _ in nil })
-            VPLog.log(String(format: "decoder warmup done in %.2fs", Date().timeIntervalSince(t)))
+            _ = try await Self.runWithTimeout(seconds: 60) {
+                await Self.decodeNoise(kit)
+                return true
+            }
+            VPLog.log(String(format: "probe %@ OK in %.2fs", p.id, Date().timeIntervalSince(t)))
+            pipeline = kit
+            activeProfile = p
+            lastUsed = Date()
+            return true
+        } catch {
+            VPLog.log("probe \(p.id) failed: \(error)")
+            return false
+        }
+    }
+
+    private func loadAndWarm(_ p: ComputeProfile) async {
+        do {
+            let kit = try await makePipeline(profile: p)
+            pipeline = kit
+            activeProfile = p
+            let t = Date()
+            await Self.decodeNoise(kit)
+            lastUsed = Date()
+            VPLog.log(String(format: "decoder warmup done in %.2fs (compute=%@)", Date().timeIntervalSince(t), p.id))
         } catch {
             VPLog.log("warmup error: \(error)")
         }
+    }
+
+    /// Réchauffe le moteur s'il n'a pas servi depuis un moment. Déclenché quand l'utilisateur
+    /// commence à parler (keyDown) : le réchauffement se fait pendant la dictée, donc gratuit
+    /// en temps perçu. No-op si le modèle est déjà chaud, pour épargner la batterie.
+    func keepWarm() async {
+        guard Date().timeIntervalSince(lastUsed) > 90 else { return }
+        guard let kit = try? await ensurePipeline() else { return }
+        VPLog.log("keep-warm (modèle froid depuis \(Int(Date().timeIntervalSince(lastUsed)))s)")
+        await Self.decodeNoise(kit)
+        lastUsed = Date()
+    }
+
+    /// Rétrograde vers le profil suivant (plus sûr) et le mémorise. Appelé si une vraie
+    /// transcription se fige malgré tout (filet réactif en plus du sondage au démarrage).
+    private func degradeProfile() {
+        let current = activeProfile ?? Self.cachedProfile() ?? Self.profiles[0]
+        guard let idx = Self.profiles.firstIndex(of: current), idx + 1 < Self.profiles.count else {
+            VPLog.log("degrade: déjà au profil le plus sûr (\(current.id))")
+            return
+        }
+        let next = Self.profiles[idx + 1]
+        Self.persist(next)
+        activeProfile = next
+        pipeline = nil
+        loading = nil
+        VPLog.log("degrade compute profile \(current.id) → \(next.id) (timeout)")
+    }
+
+    /// Décode 2 s de bruit faible pour précompiler/réchauffer le graphe CoreML du décodeur
+    /// (coûteux uniquement au 1er décodage à froid). Résultat jeté. `sampleLength: 4` borne
+    /// le décodage à quelques tokens : assez pour compiler le graphe, sans halluciner des
+    /// centaines de tokens sur du bruit.
+    private static func decodeNoise(_ pipe: WhisperKit) async {
+        var noise = [Float](repeating: 0, count: 16_000 * 2)
+        var seed: UInt64 = 0x9E3779B97F4A7C15
+        for i in 0..<noise.count {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            noise[i] = (Float(seed >> 40) / Float(1 << 24) - 0.5) * 0.1
+        }
+        let warmOptions = DecodingOptions(
+            verbose: false, task: .transcribe, language: Settings.shared.language,
+            temperature: 0.0, sampleLength: 4, usePrefillPrompt: true, skipSpecialTokens: true,
+            withoutTimestamps: true, noSpeechThreshold: 1.0, chunkingStrategy: ChunkingStrategy.none
+        )
+        _ = try? await pipe.transcribe(audioArray: noise, decodeOptions: warmOptions, callback: { _ in nil })
     }
 
     enum TranscriberError: Error, CustomStringConvertible {
@@ -83,7 +240,7 @@ actor Transcriber {
         let t0 = Date()
         VPLog.log("transcribe start file=\(fileURL.lastPathComponent)")
         let pipe = try await ensurePipeline()
-        VPLog.log(String(format: "pipeline ready in %.2fs", Date().timeIntervalSince(t0)))
+        VPLog.log(String(format: "pipeline ready in %.2fs (compute=%@)", Date().timeIntervalSince(t0), activeProfile?.id ?? "?"))
 
         let samples = try Self.loadFloatSamples(from: fileURL)
         let audioSeconds = Double(samples.count) / 16_000.0
@@ -115,12 +272,12 @@ actor Transcriber {
         VPLog.log("calling pipe.transcribe lang=\(language ?? "auto")")
         let t1 = Date()
 
-        // Défense en profondeur, en plus du backend CPU choisi à l'init :
-        //   1. Détection de boucle DANS le callback : si le décodeur Turbo se met malgré
-        //      tout à répéter un n-gramme, on renvoie `false` pour le couper à la source.
+        // Défense en profondeur, en plus du backend choisi à l'init :
+        //   1. Détection de boucle DANS le callback : si le décodeur se met malgré tout à
+        //      répéter un n-gramme, on renvoie `false` pour le couper à la source.
         //   2. Watchdog timeout : si le décodage ne rend pas la main dans un délai borné
         //      (deadlock natif qui ne répond ni à l'annulation ni au callback), on rend la
-        //      main au HUD et on abandonne la tâche figée, au lieu de tourner à l'infini.
+        //      main au HUD, on rétrograde le profil compute et on abandonne la tâche figée.
         //   3. collapseRepetitions sur le texte final, pour nettoyer tout résidu.
         let timeoutSeconds = max(20.0, audioSeconds * 5.0)
 
@@ -139,10 +296,12 @@ actor Transcriber {
             }
         } catch {
             VPLog.log("transcribe aborted: \(error)")
+            if case TranscriberError.timeout = error { degradeProfile() }
             throw error
         }
 
         VPLog.log(String(format: "whisper done in %.2fs segments=%d", Date().timeIntervalSince(t1), results.count))
+        lastUsed = Date()
         let raw = results.map(\.text).joined(separator: " ")
         let deduped = Self.collapseRepetitions(raw)
         if deduped != raw {
@@ -317,29 +476,6 @@ actor Transcriber {
             swap(&prev, &curr)
         }
         return prev[n]
-    }
-
-    private static func buildGlossaryTokens(pipe: WhisperKit, language: String?) async -> [Int]? {
-        let raw = Settings.shared.glossary.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return nil }
-        let items = raw
-            .components(separatedBy: CharacterSet(charactersIn: ",\n;"))
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !items.isEmpty, let tokenizer = pipe.tokenizer else { return nil }
-        // Phrase de contexte naturelle : Whisper doit croire à une transcription précédente
-        // qui "ouvre" sur du nouveau texte. Un prompt trop court ou trop étrange le fait
-        // émettre EOT immédiatement → résultat vide.
-        let joined = items.joined(separator: ", ")
-        let prompt: String
-        if language == "fr" {
-            prompt = " Voici la suite de la conversation. On y parle notamment de \(joined). "
-        } else {
-            prompt = " This is the continuation. It mentions \(joined). "
-        }
-        let tokens = tokenizer.encode(text: prompt)
-        VPLog.log("glossary prompt (\(items.count) items) → \(tokens.count) tokens: \"\(prompt.prefix(90))\"")
-        return tokens
     }
 
     private static func loadFloatSamples(from url: URL) throws -> [Float] {
