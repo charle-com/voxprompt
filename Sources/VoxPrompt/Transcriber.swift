@@ -237,14 +237,18 @@ actor Transcriber {
     }
 
     func transcribe(fileURL: URL) async throws -> String {
-        let t0 = Date()
         VPLog.log("transcribe start file=\(fileURL.lastPathComponent)")
+        let samples = try Self.loadFloatSamples(from: fileURL)
+        return try await transcribe(samples: samples)
+    }
+
+    func transcribe(samples: [Float]) async throws -> String {
+        let t0 = Date()
         let pipe = try await ensurePipeline()
         VPLog.log(String(format: "pipeline ready in %.2fs (compute=%@)", Date().timeIntervalSince(t0), activeProfile?.id ?? "?"))
 
-        let samples = try Self.loadFloatSamples(from: fileURL)
         let audioSeconds = Double(samples.count) / 16_000.0
-        VPLog.log(String(format: "audio loaded samples=%d (%.1fs)", samples.count, audioSeconds))
+        VPLog.log(String(format: "audio samples=%d (%.1fs)", samples.count, audioSeconds))
 
         let language = Settings.shared.language
         // Anti-loop guards. At temperature 0 the greedy decoder has no escape hatch if

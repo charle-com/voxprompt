@@ -12,6 +12,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let recorder = AudioRecorder()
     private let transcriber = Transcriber()
     private let paster = Paster()
+    private var streaming: StreamingSession?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusBar()
@@ -109,9 +110,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor private func startRecording() {
         guard !recorder.isRecording else { return }
         hud.show(state: .recording)
+        if Settings.shared.streamingEnabled {
+            let session = StreamingSession(transcriber: transcriber)
+            streaming = session
+            recorder.sampleHandler = { session.ingest($0) }
+        } else {
+            streaming = nil
+            recorder.sampleHandler = nil
+        }
         do {
             try recorder.start()
         } catch {
+            streaming = nil
+            recorder.sampleHandler = nil
             // Distinguish two failure modes: HAL not yet ready right after boot (transient,
             // retry should work) vs. permission/device actually missing (user-facing).
             let nsErr = error as NSError
@@ -126,6 +137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor private func stopAndTranscribe(target: NSRunningApplication?) async {
         guard recorder.isRecording else { return }
+        let session = streaming
+        streaming = nil
         let url = recorder.stop()
         let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
         let rms = recorder.lastRMS
@@ -142,7 +155,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hud.show(state: .transcribing)
         do {
-            let text = try await transcriber.transcribe(fileURL: url)
+            // Voie rapide : les segments transcrits pendant la dictée + la queue. Si un
+            // segment a échoué en vol, finish() renvoie nil et on retombe sur le batch
+            // complet du WAV (comportement historique, le fichier est toujours écrit).
+            let text: String
+            if let session, let streamed = await session.finish() {
+                text = streamed
+            } else {
+                if session != nil { VPLog.log("streaming failed — batch fallback on wav") }
+                text = try await transcriber.transcribe(fileURL: url)
+            }
             VPLog.log("result: \"\(text)\"")
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {

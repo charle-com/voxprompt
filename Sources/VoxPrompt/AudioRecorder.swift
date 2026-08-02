@@ -14,6 +14,9 @@ final class AudioRecorder {
     private(set) var lastDeviceName: String = "unknown"
     private(set) var lastRMS: Float = 0
     let levelPublisher = PassthroughSubject<Float, Never>()
+    /// Reçoit chaque buffer converti (16 kHz mono Float32) pendant l'enregistrement, sur le
+    /// thread du tap audio. Alimenté en parallèle du WAV — consommé par la StreamingSession.
+    var sampleHandler: (([Float]) -> Void)?
 
     /// Force CoreAudio HAL + AVAudioEngine input unit to fully initialize. At boot, the
     /// HAL daemon takes a moment to settle and the very first `engine.start()` can fail
@@ -151,6 +154,9 @@ final class AudioRecorder {
 
         if let ch = outBuf.floatChannelData?[0] {
             let n = Int(outBuf.frameLength)
+            if let handler = sampleHandler {
+                handler(Array(UnsafeBufferPointer(start: ch, count: n)))
+            }
             var sum: Float = 0
             for i in 0..<n { let s = ch[i]; sum += s * s }
             let rms = sqrtf(sum / Float(max(n, 1)))
@@ -169,6 +175,7 @@ final class AudioRecorder {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
+        sampleHandler = nil
         file = nil
         converter = nil
         inputFormat = nil

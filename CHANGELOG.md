@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-02
+
+Feature release: **streaming transcription**. Until now the entire clip was transcribed after key release (batch). The audio stream is now segmented on natural pauses (250 ms of silence, segments between 2.5 s and 12 s) and each segment is transcribed in the background **while the user is still speaking**. On key release only the last segment remains to transcribe, so perceived latency drops from "duration-of-dictation-dependent" to roughly the duration of the last sentence.
+
+### Added
+
+- **`StreamingSession`**: accumulates the 16 kHz mono float samples emitted by the recorder, cuts segments on silence (RMS < 0.004 for 250 ms, min segment 2.5 s, forced cut at 12 s), and chains background transcriptions in order. Per-segment anti-hallucination guard (RMS < 0.003 means the segment is skipped), final `collapseRepetitions` pass over the joined text.
+- **`AudioRecorder.sampleHandler`**: the tap callback now also hands the converted 16 kHz buffers to the streaming session, in parallel with the WAV file which is still written as a safety net.
+- **Preferences toggle** "Dictée en continu" (default: on) to fall back to the historical batch behavior.
+
+### Safety
+
+- If any in-flight segment fails (decoder timeout, pipeline error), `finish()` returns nil and the app transparently falls back to batch transcription of the full WAV; worst case is exactly the previous behavior.
+
 ## [0.1.5] - 2026-06-03
 
 Reliability release: after upgrading to macOS 26.5.1, dictation would hang forever ("transcription à l'infini") — the HUD stayed in "transcribing" and never returned. Root-caused by isolating the WhisperKit compute backends on the machine: with the Turbo model on macOS 26.5.1, CoreML inference **deadlocks on both the Apple Neural Engine and the GPU/Metal** (decoder frozen, 30s+ with zero tokens emitted), and only the **CPU** backend decodes correctly. The 0.1.4 anti-loop `DecodingOptions` recipe couldn't help because the decoder never even reached the token-generation stage. This release moves inference to CPU and adds independent safety nets.

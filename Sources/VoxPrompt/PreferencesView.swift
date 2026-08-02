@@ -12,6 +12,7 @@ struct PreferencesView: View {
     @State private var accessibilityGranted: Bool = AXIsProcessTrusted()
     @State private var launchAtLogin: Bool = LoginItem.isEnabled
     @State private var loginNeedsApproval: Bool = LoginItem.requiresApproval
+    @State private var streamingEnabled: Bool = Settings.shared.streamingEnabled
 
     var body: some View {
         ZStack {
@@ -26,6 +27,9 @@ struct PreferencesView: View {
                     }
                     section(title: "Modèle", subtitle: "Whisper local, Neural Engine") {
                         modelRow
+                    }
+                    section(title: "Dictée en continu", subtitle: "Transcrit pendant que tu parles") {
+                        streamingRow
                     }
                     section(title: "Collage", subtitle: "Cascade auto : CGEvent puis AppleScript") {
                         pasteModeRow
@@ -238,6 +242,32 @@ struct PreferencesView: View {
                 }
             }
             .frame(height: 80)
+        }
+    }
+
+    private var streamingRow: some View {
+        card {
+            HStack(spacing: 10) {
+                SoftDot(color: streamingEnabled ? VPPalette.ok : VPPalette.textFaint, size: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(streamingEnabled ? "Activée" : "Désactivée")
+                        .font(VPType.body(13, weight: .medium))
+                        .foregroundStyle(VPPalette.textPrimary)
+                    Text(streamingEnabled
+                         ? "Le texte est prêt quasi instantanément au relâchement"
+                         : "Transcription en une fois après le relâchement")
+                        .font(VPType.body(11))
+                        .foregroundStyle(VPPalette.textSecond)
+                }
+                Spacer()
+                Toggle("", isOn: $streamingEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .tint(VPPalette.accent)
+                    .onChange(of: streamingEnabled) { _, new in
+                        Settings.shared.streamingEnabled = new
+                    }
+            }
         }
     }
 

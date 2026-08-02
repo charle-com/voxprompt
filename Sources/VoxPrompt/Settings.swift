@@ -26,6 +26,15 @@ final class Settings {
         static let language = "whisper.language"
         static let pasteMode = "paste.mode"
         static let preferredInputUID = "audio.preferredInputUID"
+        static let streaming = "whisper.streaming"
+    }
+
+    /// Transcription en continu pendant la dictée (segments découpés sur les pauses,
+    /// transcrits en arrière-plan). Défaut : activé. En cas d'échec d'un segment,
+    /// l'app retombe d'elle-même sur la transcription batch du WAV complet.
+    var streamingEnabled: Bool {
+        get { defaults.object(forKey: Keys.streaming) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Keys.streaming) }
     }
 
     /// UID CoreAudio du device d'entree a forcer. nil = default systeme.
