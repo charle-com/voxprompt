@@ -36,9 +36,14 @@ enum VPLog {
         FileHandle.standardError.write(Data(line.utf8))
         guard let data = line.data(using: .utf8) else { return }
         if let handle = try? FileHandle(forWritingTo: url) {
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-            try? handle.close()
+            defer { try? handle.close() }
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } catch {
+                // Journal indisponible (disque plein, fichier supprime) : on ne fait
+                // surtout pas echouer la dictee pour autant.
+            }
         }
     }
 }

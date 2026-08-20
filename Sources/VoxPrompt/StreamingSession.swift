@@ -1,4 +1,5 @@
 import Foundation
+import VoxPromptCore
 
 /// Transcription en continu pendant la dictée : reçoit les samples 16 kHz mono produits
 /// par l'AudioRecorder au fil de l'eau, découpe le flux sur les pauses naturelles et
@@ -13,12 +14,18 @@ final class StreamingSession {
     private let transcriber: Transcriber
     private let lock = NSLock()
 
-    // État protégé par `lock` — `ingest` arrive sur le thread temps réel du tap audio,
-    // les résultats de transcription sur des Tasks concurrents.
+    // État protégé par `lock`. `ingest` arrive sur le thread temps réel du tap audio,
+    // `finish` sur le main thread, les résultats sur des Tasks concurrents. TOUTE la
+    // section critique (lecture de `chain` + création de la tâche + réécriture de `chain`)
+    // se fait sous le MÊME verrou : deux verrouillages séparés laissaient une coupe
+    // naturelle et `finish()` créer deux tâches qui lisaient le même `previous`, donc
+    // deux segments décodés en parallèle dont un seul était attendu. Une phrase entière
+    // disparaissait alors en silence.
     private var pending: [Float] = []      // samples du segment en cours (pas encore transcrits)
     private var silentRun = 0              // samples consécutifs sous le seuil de silence
     private var texts: [String?] = []      // résultats ordonnés par segment (nil = en cours)
     private var chain: Task<Void, Never>?  // sérialise les transcriptions, préserve l'ordre
+    private var tasks: [Task<Void, Never>] = []  // TOUTES les tâches en vol, pour `finish()`
     private var failed = false
     private var finished = false
     private var segmentCount = 0
@@ -33,6 +40,8 @@ final class StreamingSession {
     private static let minSegmentSamples = sampleRate * 5 / 2    // 2,5 s
     private static let maxSegmentSamples = sampleRate * 12       // 12 s
     private static let minTailSamples = sampleRate / 4           // tail < 250 ms : rien à dire
+    private static let cutWindowSamples = sampleRate / 50        // 20 ms
+    private static let cutLookbackSamples = sampleRate           // 1 s
 
     init(transcriber: Transcriber) {
         self.transcriber = transcriber
@@ -58,56 +67,90 @@ final class StreamingSession {
         let forcedCut = pending.count >= Self.maxSegmentSamples
         guard naturalCut || forcedCut else { lock.unlock(); return }
 
-        let segment = pending
-        pending = []
+        let isForced = forcedCut && !naturalCut
+        // Coupe forcée : jamais à l'instant exact (souvent en plein mot), mais au creux
+        // d'énergie de la dernière seconde. Le reliquat repart dans le segment suivant.
+        let cutIndex = isForced ? Self.bestCutIndex(pending) : pending.count
+        let segment = Array(pending[..<cutIndex])
+        pending.removeFirst(cutIndex)
         silentRun = 0
+        let note = enqueueLocked(segment, reason: isForced ? "forced" : "pause")
         lock.unlock()
 
-        enqueue(segment, reason: forcedCut && !naturalCut ? "forced" : "pause")
+        if let note { VPLog.log(note) }
     }
 
     /// Fin de dictée : transcrit la queue restante, attend les segments en vol et renvoie
     /// le texte complet. nil = un segment a échoué, l'appelant doit retomber sur le batch.
     func finish() async -> String? {
+        // Sections critiques déportées dans des helpers SYNCHRONES : un verrou ne doit
+        // jamais être pris dans une fonction `async` (règle Swift 6, warning en mode 5).
+        let (alreadyFailed, note) = closeAndEnqueueTail()
+        if let note { VPLog.log(note) }
+        if alreadyFailed { return nil }
+
+        // Attendre TOUTES les tâches, pas seulement la dernière : la boucle vide le
+        // tableau sous verrou et recommence tant qu'il en est arrivé de nouvelles.
+        while true {
+            let batch = drainTasks()
+            if batch.isEmpty { break }
+            for task in batch { await task.value }
+        }
+
+        return assembleText()
+    }
+
+    /// Ferme la session, met la queue restante en file et dit si un segment avait déjà échoué.
+    private func closeAndEnqueueTail() -> (failed: Bool, note: String?) {
         lock.lock()
+        defer { lock.unlock() }
         finished = true
         let tail = pending
         pending = []
-        let alreadyFailed = failed
-        lock.unlock()
+        if failed { return (true, nil) }
+        guard tail.count >= Self.minTailSamples else { return (false, nil) }
+        return (false, enqueueLocked(tail, reason: "tail"))
+    }
 
-        if alreadyFailed { return nil }
-        if tail.count >= Self.minTailSamples {
-            enqueue(tail, reason: "tail")
-        }
+    private func drainTasks() -> [Task<Void, Never>] {
+        lock.lock()
+        defer { lock.unlock() }
+        let batch = tasks
+        tasks.removeAll()
+        return batch
+    }
 
-        await chain?.value
-
+    private func assembleText() -> String? {
         lock.lock()
         defer { lock.unlock() }
         if failed { return nil }
+        // `texts` est indexé par segment : l'ordre de la dictée est préservé quel que soit
+        // l'ordre d'achèvement des tâches.
         let joined = texts.compactMap { $0 }
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-        let deduped = Transcriber.collapseRepetitions(joined)
+        let deduped = TextCleanup.collapseRepetitions(joined)
         VPLog.log("streaming finish: \(texts.count) segment(s), \(deduped.count) chars")
         return deduped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func enqueue(_ segment: [Float], reason: String) {
-        lock.lock()
+    /// Précondition : `lock` est DÉJÀ pris par l'appelant, et le reste jusqu'au retour.
+    /// Renvoie la ligne de log à émettre HORS verrou (ou nil s'il n'y a rien à faire).
+    private func enqueueLocked(_ segment: [Float], reason: String) -> String? {
+        guard !failed else { return nil }
         let index = texts.count
         texts.append(nil)
         segmentCount += 1
         let seg = segmentCount
         let previous = chain
-        lock.unlock()
-
-        VPLog.log(String(format: "streaming segment #%d (%@, %.1fs) queued", seg, reason,
-                         Double(segment.count) / Double(Self.sampleRate)))
 
         let task = Task(priority: .userInitiated) { [transcriber] in
             await previous?.value
+
+            // Court-circuit : une fois la session en échec, plus AUCUN segment ne décode.
+            // Sans ça, les segments déjà en file continuaient de solliciter le moteur pour
+            // un résultat que `finish()` allait de toute façon jeter.
+            if self.isFailed() { return }
 
             // Garde anti-hallucination par segment, même logique que le batch : sous le
             // bruit de fond, Whisper invente des artefacts de training set.
@@ -115,14 +158,16 @@ final class StreamingSession {
             for s in segment { sum += s * s }
             let rms = sqrtf(sum / Float(max(segment.count, 1)))
             if rms < 0.003 {
-                VPLog.log("streaming segment #\(seg): silence (rms=\(rms)) — skipped")
+                VPLog.log("streaming segment #\(seg): silence (rms=\(rms)) : skipped")
                 self.setText("", at: index)
                 return
             }
 
             do {
                 let t = Date()
-                let text = try await transcriber.transcribe(samples: segment)
+                // Continuité : le décodeur reçoit la fin du segment précédent en prompt,
+                // il garde donc casse et ponctuation quand la coupe tombe en plein mot.
+                let text = try await transcriber.transcribe(samples: segment, promptText: self.promptTail())
                 let cleaned = Self.isNoiseAnnotation(text) ? "" : text
                 if cleaned.isEmpty && !text.isEmpty {
                     VPLog.log("streaming segment #\(seg): noise annotation \"\(String(text.prefix(40)))\" dropped")
@@ -131,14 +176,40 @@ final class StreamingSession {
                                  seg, Date().timeIntervalSince(t), String(cleaned.prefix(60))))
                 self.setText(cleaned, at: index)
             } catch {
-                VPLog.log("streaming segment #\(seg) FAILED: \(error) — batch fallback armed")
+                VPLog.log("streaming segment #\(seg) FAILED: \(error) : batch fallback armed")
                 self.markFailed()
             }
         }
 
-        lock.lock()
         chain = task
-        lock.unlock()
+        tasks.append(task)
+        return String(format: "streaming segment #%d (%@, %.1fs) queued", seg, reason,
+                      Double(segment.count) / Double(Self.sampleRate))
+    }
+
+    /// Cherche le creux d'énergie de la dernière seconde (fenêtres de 20 ms) pour couper
+    /// entre deux mots plutôt qu'au milieu d'une syllabe. Renvoie l'indice de coupe, borné
+    /// pour laisser au segment sa durée minimale.
+    static func bestCutIndex(_ buffer: [Float]) -> Int {
+        let total = buffer.count
+        guard total > minSegmentSamples else { return total }
+        let lookback = min(cutLookbackSamples, total - minSegmentSamples)
+        guard lookback >= cutWindowSamples * 2 else { return total }
+        let start = total - lookback
+        var bestIndex = total
+        var bestEnergy = Float.greatestFiniteMagnitude
+        var i = start
+        while i + cutWindowSamples <= total {
+            var sum: Float = 0
+            for k in i..<(i + cutWindowSamples) { sum += buffer[k] * buffer[k] }
+            let rms = sqrtf(sum / Float(cutWindowSamples))
+            if rms < bestEnergy {
+                bestEnergy = rms
+                bestIndex = i + cutWindowSamples / 2   // milieu du creux
+            }
+            i += cutWindowSamples
+        }
+        return bestIndex
     }
 
     /// Sur un segment de bruit (respiration, frottement) au-dessus du seuil RMS, Whisper
@@ -156,10 +227,28 @@ final class StreamingSession {
         return !trimmed.contains(where: { $0.isLetter || $0.isNumber })
     }
 
+    /// Fin du texte déjà transcrit, pour le prompt du segment suivant. Appelée APRÈS
+    /// `await previous?.value`, donc les segments antérieurs ont tous rendu leur texte.
+    private func promptTail() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let text = texts.compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !text.isEmpty else { return nil }
+        return String(text.suffix(200))
+    }
+
     private func setText(_ text: String, at index: Int) {
         lock.lock()
         if index < texts.count { texts[index] = text }
         lock.unlock()
+    }
+
+    private func isFailed() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
     }
 
     private func markFailed() {

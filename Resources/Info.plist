@@ -13,18 +13,26 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.0</string>
+	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>7</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>VoxPrompt utilise les Apple Events pour coller le texte transcrit dans la fenetre active quand le mode auto echoue.</string>
+	<string>VoxPrompt utilise les Apple Events pour coller le texte transcrit dans la fenetre active quand le collage direct echoue.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Charles Neveu. Licence MIT.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>VoxPrompt a besoin du microphone pour enregistrer et transcrire votre voix.</string>
+	<string>VoxPrompt a besoin du microphone pour enregistrer et transcrire votre voix sur votre Mac.</string>
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
 </dict>
 </plist>

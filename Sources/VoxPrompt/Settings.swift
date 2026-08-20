@@ -8,7 +8,7 @@ enum PasteMode: String, CaseIterable, Codable, Hashable {
 
     var label: String {
         switch self {
-        case .auto: return "Auto (recommande)"
+        case .auto: return "Auto (recommandé)"
         case .appleScriptOnly: return "AppleScript uniquement"
         case .unicode: return "Insertion Unicode (robuste)"
         case .clipboardOnly: return "Presse-papier uniquement"
@@ -27,6 +27,8 @@ final class Settings {
         static let pasteMode = "paste.mode"
         static let preferredInputUID = "audio.preferredInputUID"
         static let streaming = "whisper.streaming"
+        static let updateCheckEnabled = "update.checkEnabled"
+        static let appleScriptBundleIDs = "paste.appleScriptBundleIDs"
     }
 
     /// Transcription en continu pendant la dictée (segments découpés sur les pauses,
@@ -37,9 +39,13 @@ final class Settings {
         set { defaults.set(newValue, forKey: Keys.streaming) }
     }
 
-    /// UID CoreAudio du device d'entree a forcer. nil = default systeme.
-    /// Defaut : `BuiltInMicrophoneDevice` pour eviter que le default systeme glisse
-    /// sur Teams Loopback / BlackHole / iPhone Continuity (cause de captures muettes).
+    /// UID CoreAudio du périphérique d'entrée à utiliser. `nil` = périphérique par
+    /// défaut du système, résolu au moment de l'enregistrement.
+    ///
+    /// Défaut : `BuiltInMicrophoneDevice`. Ce n'est pas un caprice : le périphérique par
+    /// défaut du système glisse tout seul vers Teams Loopback, BlackHole ou un iPhone en
+    /// Continuité, et la dictée devient alors silencieuse sans prévenir. Le micro interne
+    /// est le seul choix qui ne disparaît jamais. Modifiable dans les préférences.
     var preferredInputUID: String? {
         get {
             if let v = defaults.object(forKey: Keys.preferredInputUID) as? String {
@@ -56,7 +62,13 @@ final class Settings {
         set { defaults.set(newValue, forKey: Keys.language) }
     }
 
-    /// Glossaire : noms propres, marques, jargon. Injecté comme initial prompt Whisper.
+    /// Glossaire : noms propres, marques, jargon. Appliqué APRÈS la transcription
+    /// (correspondance exacte, puis approchée selon la longueur du terme, en épargnant
+    /// les mots présents au dictionnaire).
+    ///
+    /// Ce n'est pas une amorce envoyée au décodeur : mesuré sur WhisperKit 0.18, passer
+    /// plus de deux `promptTokens` fait prédire la fin de transcription au décodeur, qui
+    /// renvoie alors un segment vide. L'injection est donc désactivée côté Transcriber.
     var glossary: String {
         get { defaults.string(forKey: "whisper.glossary") ?? "" }
         set { defaults.set(newValue, forKey: "whisper.glossary") }
@@ -90,6 +102,22 @@ final class Settings {
             return mode
         }
         set { defaults.set(newValue.rawValue, forKey: Keys.pasteMode) }
+    }
+
+    /// Applications à coller directement par AppleScript, sans tenter les évènements
+    /// clavier synthétiques. Échappatoire sans recompilation pour une app récalcitrante :
+    /// `defaults write fr.charlesneveu.voxprompt paste.appleScriptBundleIDs -array com.example.app`
+    var appleScriptBundleIDs: [String] {
+        get { defaults.stringArray(forKey: Keys.appleScriptBundleIDs) ?? [] }
+        set { defaults.set(newValue, forKey: Keys.appleScriptBundleIDs) }
+    }
+
+    /// Vérification de l'existence d'une version plus récente sur GitHub.
+    /// **Désactivée par défaut** : c'est le seul appel réseau de l'app en dehors du
+    /// téléchargement du modèle, et il doit rester un choix explicite de l'utilisateur.
+    var updateCheckEnabled: Bool {
+        get { defaults.bool(forKey: Keys.updateCheckEnabled) }
+        set { defaults.set(newValue, forKey: Keys.updateCheckEnabled) }
     }
 }
 

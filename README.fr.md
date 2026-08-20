@@ -1,90 +1,144 @@
 # VoxPrompt
 
-App macOS menu bar de dictée vocale **100 % locale**. Maintiens une touche, parle, relâche : le texte est transcrit par WhisperKit sur le Neural Engine et collé dans l'app active. Inspirée de Superwhisper, offline et gratuite.
+App macOS de barre de menus pour la dictée vocale **100 % locale**. Maintiens une touche, parle, relâche : le texte est transcrit par Whisper sur le Neural Engine de ton Mac, puis collé dans l'app active. Alternative libre et gratuite à Superwhisper.
 
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black) ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-required-black) ![License](https://img.shields.io/badge/license-MIT-blue)
 
+[Version anglaise](README.md) · [Télécharger](https://github.com/charle-com/voxprompt/releases/latest)
+
 ## Fonctionnalités
 
-- Transcription locale Whisper (aucun envoi réseau sauf téléchargement du modèle au premier lancement)
-- Raccourci global (Right Option par défaut, configurable)
-- HUD flottant avec waveform temps réel
-- Glossaire de noms propres / jargon avec correction fuzzy-match
-- Menu bar popover épuré, thème clair
-- Support multilingue (FR/EN auto ou forcé)
+- Transcription locale par Whisper, aucun envoi réseau hormis le téléchargement du modèle au premier lancement
+- Transcription en continu : les phrases sont transcrites pendant que tu parles, le texte tombe environ une seconde après le relâchement
+- Raccourci global maintenu (Option droite par défaut, configurable)
+- HUD flottant avec waveform alimentée par le vrai signal du micro
+- Choix explicite du microphone, pour qu'un casque Bluetooth qui se connecte ne vole pas l'entrée
+- Glossaire de noms propres et de jargon, avec correction floue qui ne touche pas aux mots déjà valides
+- Tableau de bord des autorisations dans les préférences (micro, accessibilité, automatisation) avec bouton de réparation
+- Multilingue, les 99 langues de Whisper, détection automatique ou langue forcée
+- Collage fiable dans l'app active, avec voie de secours pour les apps qui refusent les frappes simulées
+- Rien d'ouvert au repos : aucun périphérique audio n'est mobilisé tant que tu n'as pas appuyé
 
 ## Installation
 
-### Via DMG
-```bash
-./build.sh && ./package-dmg.sh
-open build/VoxPrompt.dmg
-```
-Glisser `VoxPrompt.app` dans `/Applications`.
-
-### Build et run direct
-```bash
-./build.sh
-open build/VoxPrompt.app
-```
-
-## Signature persistante (recommandé)
-
-Par défaut macOS invalide l'autorisation Accessibility à chaque rebuild (nouvelle signature ad-hoc). Pour garder l'autorisation entre les builds, crée une identité de code signing persistante :
+### En une commande (recommandé)
 
 ```bash
-./setup-signing.sh
+curl -fsSL https://raw.githubusercontent.com/charle-com/voxprompt/main/install.sh | bash
 ```
 
-Le script génère une identité auto-signée "VoxPrompt Developer" dans ton trousseau. Les builds suivants l'utiliseront automatiquement.
+Le script télécharge la dernière version, vérifie sa signature face au certificat du projet, l'installe dans `/Applications` et la lance. Aucun `sudo`, rien d'autre n'est modifié. Cette voie évite aussi l'avertissement macOS décrit ci-dessous, un fichier récupéré par `curl` n'étant pas mis en quarantaine.
 
-## Permissions
+### Par le DMG
 
-1. **Microphone** : popup automatique au premier enregistrement
-2. **Accessibilité** : Réglages → Confidentialité et sécurité → Accessibilité → ajouter VoxPrompt
-   (nécessaire pour capter la touche globale et simuler Cmd+V)
+Récupère-le depuis la [dernière version publiée](https://github.com/charle-com/voxprompt/releases/latest), ouvre-le et glisse `VoxPrompt.app` dans `/Applications`.
+
+macOS refusera le premier lancement : VoxPrompt est signée mais pas notarisée par Apple, la notarisation exigeant un compte développeur payant que ce projet n'a pas. Ouvre alors **Réglages Système > Confidentialité et sécurité**, descends jusqu'au message concernant VoxPrompt et clique sur **Ouvrir quand même**. C'est à faire une seule fois.
+
+### Depuis les sources
+
+```bash
+git clone https://github.com/charle-com/voxprompt.git
+cd voxprompt
+./setup-signing.sh    # une seule fois, crée l'identité de signature persistante
+./build.sh --install  # compile, vérifie la signature, installe dans /Applications
+```
+
+Xcode complet requis : WhisperKit et MLX ne compilent pas avec les seuls Command Line Tools.
+
+## Fonctionnement
+
+1. **Maintiens** ta touche. Un HUD apparaît en bas de l'écran avec la waveform en direct.
+2. **Parle** normalement. L'audio est capturé en 16 kHz mono et découpé sur les pauses ; chaque morceau part en transcription pendant que tu continues.
+3. **Relâche.** Il ne reste que la dernière phrase à transcrire. Le texte est collé là où se trouve ton curseur.
+
+Au premier lancement, le modèle (632 Mo pour celui par défaut) est téléchargé une fois, avec la progression affichée dans le HUD. Ensuite tout vient du cache local.
+
+## Autorisations
+
+| Autorisation | Requise | Pourquoi |
+|---|---|---|
+| **Microphone** | Oui | Capturer ta voix. macOS le demande au premier lancement. |
+| **Accessibilité** | Oui | Détecter la touche maintenue et coller le texte. À accorder dans les Réglages, macOS ne sait pas la demander par une fenêtre. |
+| **Automatisation** | Optionnelle | Seulement comme voie de secours pour le collage dans les apps qui ignorent les frappes simulées. |
+
+Les préférences affichent l'état des trois en direct et ouvrent le bon panneau des Réglages d'un clic.
+
+## Dépannage
+
+### La touche ne fait rien
+
+L'accessibilité n'est pas accordée, ou a été révoquée en silence. Ouvre **Préférences > Accessibilité** dans VoxPrompt, l'état est affiché en direct. Si macOS montre VoxPrompt comme déjà autorisée alors que rien ne se passe, désactive puis réactive l'entrée, ou lance :
+
+```bash
+tccutil reset Accessibility fr.charlesneveu.voxprompt
+```
+
+puis relance VoxPrompt et accorde à nouveau.
+
+### Le HUD affiche « Aucun son » alors que j'ai parlé
+
+Vérifie le micro sélectionné dans **Préférences > Microphone**. Si tu compiles depuis les sources, assure-toi que la signature embarque bien le fichier d'entitlements : sous hardened runtime, macOS fournit silencieusement un flux rempli de zéros à une app dépourvue de `com.apple.security.device.audio-input`. `./build.sh` le vérifie et refuse de produire un bundle inutilisable.
+
+### Le texte finit dans le presse-papier au lieu de l'app
+
+Certaines apps refusent les frappes simulées. VoxPrompt bascule alors sur AppleScript, qui demande l'autorisation d'automatisation la première fois. Si l'app cible résiste quand même, passe **Préférences > Collage** sur `AppleScript uniquement`. Le texte reste toujours dans le presse-papier, un ⌘V manuel fonctionne.
+
+### La transcription est lente ou se bloque
+
+macOS 26.5.x embarque un bug CoreML qui fige l'inférence Whisper sur le Neural Engine et sur le GPU. VoxPrompt teste les moteurs disponibles au démarrage, retient le plus rapide qui fonctionne réellement pour ta version exacte de macOS, et retente automatiquement quand Apple publie un correctif. Un décodage bloqué est abandonné par un chien de garde au lieu de tourner indéfiniment. Pour forcer un nouveau test :
+
+```bash
+defaults delete fr.charlesneveu.voxprompt whisper.computeProfile
+```
+
+### Plus rien ne marche après avoir déplacé l'app
+
+Une app lancée depuis un emplacement en quarantaine s'exécute depuis un volume temporaire en lecture seule, ce qui casse ses autorisations. Réinstalle avec le script en une ligne, ou lance `xattr -cr /Applications/VoxPrompt.app`.
 
 ## Modèles Whisper
 
-Téléchargés automatiquement depuis [huggingface.co/argmaxinc/whisperkit-coreml](https://huggingface.co/argmaxinc/whisperkit-coreml). Choix dans les Préférences.
+| Modèle | Taille | Qualité |
+|---|---|---|
+| **Large v3 Turbo** (par défaut) | 632 Mo | Excellente, multilingue |
+| Large v3 | 626 Mo | Maximale |
+| Base | 74 Mo | Correcte |
+| Tiny | 39 Mo | Test uniquement |
 
-| Modèle | Taille | Latence | Qualité |
-|--------|--------|---------|---------|
-| Large v3 Turbo (défaut) | 632 Mo | ~1 s | Excellente, multilingue |
-| Large v3 | 626 Mo | ~2 s | Max |
-| Base | 74 Mo | instant | Moyenne |
-| Tiny | 39 Mo | instant | Test uniquement |
+Changement de modèle depuis les préférences. Le nouveau modèle se télécharge au premier usage.
 
 ## Glossaire
 
-Les noms propres, marques ou termes techniques mal reconnus par Whisper peuvent être ajoutés dans **Préférences → Glossaire** (séparés par virgule ou retour ligne).
+Whisper est excellent sur la parole courante mais bute sur les noms propres (clients, marques, jargon). Ajoute-les dans **Préférences > Glossaire**, séparés par des virgules ou des retours à la ligne. Après chaque transcription, les mots proches sont corrigés avec la bonne orthographe et la bonne casse, tandis que les mots déjà valides sont laissés intacts.
 
-Après chaque transcription, chaque mot du texte est comparé en distance de Levenshtein à chaque item du glossaire. Les correspondances phonétiques proches sont remplacées par la version du glossaire (avec la bonne casse).
+```
+Glossaire : Gandy, Kwanko, Shopify, Klaviyo
 
-Exemple : glossaire `Gandy` → `"Je vois Gandhi demain"` devient `"Je vois Gandy demain"`.
+Whisper entend       ->  VoxPrompt écrit
+« je vois Gandhi »   ->  « je vois Gandy »
+« envoie sur Shopi » ->  « envoie sur Shopify »
+```
 
-## Debug
+## Signature et mises à jour
 
-Logger fichier désactivé par défaut. Pour l'activer :
+VoxPrompt est signée avec une identité auto-signée stable, ce qui permet à macOS de conserver l'autorisation d'accessibilité d'une version à l'autre. Elle n'est volontairement **pas** notarisée : la notarisation exige un compte Apple Developer payant.
+
+La vérification de mise à jour est **désactivée par défaut**. Activée dans les préférences, elle interroge GitHub une fois par jour pour savoir si une version plus récente existe, puis ouvre simplement la page de la release. Aucun téléchargement automatique, aucun installateur en tâche de fond.
+
+## Journal de débogage
+
+Désactivé par défaut, le texte transcrit pouvant contenir des données sensibles.
+
 ```bash
 launchctl setenv VOXPROMPT_DEBUG 1
 ```
-Les logs vont dans `~/Library/Logs/VoxPrompt/voxprompt.log` (perms 0600).
 
-## Stack
+Journal écrit dans `~/Library/Logs/VoxPrompt/voxprompt.log` en mode `0600`.
 
-- Swift 5.10+, SwiftUI, AppKit
-- [WhisperKit](https://github.com/argmaxinc/argmax-oss-swift) (CoreML + MLX)
-- AVFoundation (capture audio 16 kHz mono)
-- NSEvent global monitor (hotkey)
-- NSPasteboard + CGEvent (paste)
+## Confidentialité
 
-## Privacy
+Ta voix ne quitte jamais ton Mac. Transcription intégralement locale, aucune API distante, aucune télémétrie, aucun SDK tiers. Le réseau n'est sollicité que deux fois, et toujours sous ton contrôle : le téléchargement du modèle au premier usage, et la vérification de mise à jour que tu dois activer toi-même. Détail dans [PRIVACY.md](PRIVACY.md).
 
-- **100 % local** : aucune transcription, audio ou texte n'est envoyé nulle part
-- Seul appel réseau : téléchargement du modèle Whisper au premier usage
-- Aucune télémétrie, aucun tracker, aucun analytics
+## Licence
 
-## License
-
-[MIT](LICENSE)
+[MIT](LICENSE) · Charles Neveu

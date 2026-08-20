@@ -6,7 +6,13 @@ enum HUDState: Equatable {
     case idle
     case recording
     case transcribing
+    /// Telechargement du modele Whisper au premier usage ou apres un changement de modele.
+    /// Progression de 0 a 1, ou nil quand la taille totale n'est pas connue.
+    case downloading(progress: Double?)
     case done
+    /// Le texte est bien transcrit mais n'a pas pu etre colle : il attend dans le
+    /// presse-papier. Ce n'est PAS une erreur, l'utilisateur n'a qu'a faire Cmd+V.
+    case clipboard(reason: String)
     case error(message: String)
 }
 
@@ -30,23 +36,31 @@ final class HUDController {
         state.send(newState)
 
         guard let window else { return }
+        resize(window, to: newState.preferredWidth)
         positionAtBottomCenter(window)
         window.orderFrontRegardless()
 
+        // Un message que l'utilisateur doit lire reste plus longtemps qu'un simple
+        // accuse de reception. Le telechargement, lui, ne se cache jamais tout seul.
+        let delay: TimeInterval?
         switch newState {
-        case .done, .error:
+        case .done: delay = 1.4
+        case .error: delay = 2.6
+        case .clipboard: delay = 3.4
+        case .idle, .recording, .transcribing, .downloading: delay = nil
+        }
+        if let delay {
             hideTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_400_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 if !Task.isCancelled { self?.hide() }
             }
-        default: break
         }
     }
 
     func hide() { window?.orderOut(nil) }
 
     private func buildWindow() {
-        let rect = NSRect(x: 0, y: 0, width: 240, height: 52)
+        let rect = NSRect(x: 0, y: 0, width: HUDState.idle.preferredWidth, height: 52)
         let panel = NSPanel(
             contentRect: rect,
             styleMask: [.borderless, .nonactivatingPanel],
@@ -67,8 +81,22 @@ final class HUDController {
         window = panel
     }
 
+    private func resize(_ window: NSWindow, to width: CGFloat) {
+        guard window.frame.size.width != width else { return }
+        var frame = window.frame
+        frame.size.width = width
+        window.setFrame(frame, display: false)
+        window.contentView?.frame = NSRect(origin: .zero, size: frame.size)
+    }
+
+    /// Affiche le HUD sur l'ecran ou se trouve reellement l'utilisateur. `NSScreen.main`
+    /// designe l'ecran de la fenetre active : pour une app en `.accessory`, qui n'a jamais
+    /// le focus, cela renvoie l'ecran principal, pas celui ou l'on est en train de dicter.
     private func positionAtBottomCenter(_ window: NSWindow) {
-        guard let screen = NSScreen.main else { return }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
+            ?? NSScreen.main
+        guard let screen else { return }
         let visible = screen.visibleFrame
         let size = window.frame.size
         let origin = NSPoint(
@@ -76,6 +104,18 @@ final class HUDController {
             y: visible.minY + 48
         )
         window.setFrameOrigin(origin)
+    }
+}
+
+private extension HUDState {
+    /// Les etats porteurs d'un message a lire ont besoin de plus de place que
+    /// « J'ecoute » ou « Colle ».
+    var preferredWidth: CGFloat {
+        switch self {
+        case .idle, .recording, .transcribing, .done: return 240
+        case .downloading: return 260
+        case .clipboard, .error: return 320
+        }
     }
 }
 
@@ -102,12 +142,13 @@ private struct HUDView: View {
                 Text(title)
                     .font(VPType.body(13, weight: .medium))
                     .foregroundStyle(VPPalette.textPrimary)
+                    .fixedSize(horizontal: true, vertical: false)
                 Spacer(minLength: 8)
                 trailingDetail
             }
             .padding(.horizontal, 18)
         }
-        .frame(width: 240, height: 52)
+        .frame(height: 52)
         .clipShape(Capsule())  // clip dur pour éviter tout débordement
         .shadow(color: .black.opacity(0.12), radius: 20, y: 10)
         .shadow(color: .black.opacity(0.06), radius: 4, y: 2)
@@ -124,6 +165,9 @@ private struct HUDView: View {
         case .transcribing:
             ProgressIndicator()
                 .frame(width: 22, height: 22)
+        case .downloading(let progress):
+            DownloadIndicator(progress: progress)
+                .frame(width: 22, height: 22)
         case .done:
             ZStack {
                 Circle().fill(VPPalette.ok.opacity(0.16))
@@ -132,10 +176,18 @@ private struct HUDView: View {
                     .foregroundStyle(VPPalette.ok)
             }
             .frame(width: 22, height: 22)
+        case .clipboard:
+            ZStack {
+                Circle().fill(VPPalette.accent.opacity(0.16))
+                Image(systemName: "doc.on.clipboard")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(VPPalette.accent)
+            }
+            .frame(width: 22, height: 22)
         case .error:
             ZStack {
                 Circle().fill(VPPalette.live.opacity(0.16))
-                Image(systemName: "xmark")
+                Image(systemName: "exclamationmark")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(VPPalette.live)
             }
@@ -172,6 +224,7 @@ private struct HUDView: View {
                 .font(VPType.body(12))
                 .foregroundStyle(VPPalette.textSecond)
                 .lineLimit(1)
+                .truncationMode(.tail)
         }
     }
 
@@ -180,7 +233,9 @@ private struct HUDView: View {
         case .idle: return "VoxPrompt"
         case .recording: return "J'écoute"
         case .transcribing: return "Transcription"
+        case .downloading: return "Téléchargement"
         case .done: return "Collé"
+        case .clipboard: return "Presse-papier"
         case .error: return "Erreur"
         }
     }
@@ -190,7 +245,11 @@ private struct HUDView: View {
         case .idle: return ""
         case .recording: return "relâche pour transcrire"
         case .transcribing: return "whisper"
-        case .done: return "dans le presse-papier"
+        case .downloading(let progress):
+            guard let progress else { return "modèle Whisper" }
+            return "\(Int(progress * 100)) %"
+        case .done: return "dans l'app active"
+        case .clipboard(let reason): return reason
         case .error(let m): return m
         }
     }
@@ -231,6 +290,29 @@ private struct ProgressIndicator: View {
                 }
             }
             .padding(3)
+    }
+}
+
+/// Anneau de progression du telechargement. Retombe sur l'indicateur indetermine
+/// tant que la taille totale n'est pas connue.
+private struct DownloadIndicator: View {
+    var progress: Double?
+
+    var body: some View {
+        if let progress {
+            ZStack {
+                Circle()
+                    .stroke(VPPalette.accent.opacity(0.18), lineWidth: 1.8)
+                Circle()
+                    .trim(from: 0, to: max(0.02, min(1, progress)))
+                    .stroke(VPPalette.accent, style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+                    .rotationEffect(.degrees(-90))
+                    .animation(.easeOut(duration: 0.3), value: progress)
+            }
+            .padding(3)
+        } else {
+            ProgressIndicator()
+        }
     }
 }
 

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Hardened runtime : chaque acces a une ressource protegee doit etre declare ici,
+	  sinon macOS le refuse EN SILENCE (pas de dialogue, pas d'erreur).
+
+	  Verifie empiriquement le 2026-08-20 sur macOS 26.5.2 (25F84) avec trois bundles
+	  de test identiques ne differant que par leur signature :
+	    - runtime sans entitlement : AVCaptureDevice.requestAccess renvoie false en 0,00 s
+	      et la capture rend des echantillons TOUS a zero (RMS 0.000000) sans lever d'erreur ;
+	    - runtime avec ces entitlements : le dialogue d'autorisation s'affiche normalement.
+	  C'est la cause du symptome "l'app n'entend plus rien apres une mise a jour" : tant
+	  qu'une ancienne autorisation TCC existe elle masque le probleme, sa reevaluation le revele.
+	-->
+
+	<!-- Capture du microphone (AVCaptureDevice, AudioUnit HAL en entree). -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+
+	<!-- Envoi d'Apple Events vers System Events : voie de secours du collage automatique
+	     quand l'application cible ignore les CGEvent postes a son PID. -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

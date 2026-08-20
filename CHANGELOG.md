@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-08-20
+
+Stability release. VoxPrompt now holds its macOS permissions across updates, never touches your audio output devices, and cannot leave the microphone open. This is the first version considered production ready.
+
+### Fixed
+
+- **Permissions silently revoked (root cause).** The app was signed with the hardened runtime but shipped no entitlements file. Verified on macOS 26.5.2 with three otherwise identical bundles: with the runtime flag and no entitlements, `AVCaptureDevice.requestAccess` returns `false` in 0.00 s and a real capture returns 57344 frames of pure zeroes (RMS 0.000000) with no error raised anywhere. The app believes it is recording and writes a silent WAV. An older TCC grant masks the problem until macOS re-evaluates it, which is why it looked like "updates break the permissions". `VoxPrompt.entitlements` now declares `com.apple.security.device.audio-input` and `com.apple.security.automation.apple-events`, and `build.sh` refuses to produce a bundle without them. The designated requirement is unchanged, so existing grants survive the update.
+- **Bluetooth headphones degraded while VoxPrompt was merely running.** `AVAudioEngine` attaches the default input AND output devices as soon as `inputNode` is touched, which pushed AirPods into hands-free profile (24 kHz) even when idle. Capture is now an input-only AudioUnit HAL bound to an explicitly resolved device, so the output side is never touched: verified with the speakers staying at `running=0` throughout a recording.
+- **Microphone could stay open forever.** A missed key-up (locked screen, secure input field, another app swallowing the event, popover holding focus) left the recorder running with no way back. Fixed with a local event monitor alongside the global one, a 250 ms watchdog that reads the real physical key state, a hard 180 s cap, and forced release on session lock and system sleep.
+- **Crash on the second recording attempt after a cold-start failure.** A failed start left the audio tap installed; the next attempt hit an unrecoverable ObjC exception. The audio unit is now fully torn down on every error path.
+- **Model could be corrupted on first launch.** Warmup did not publish its loading task, so pressing the hotkey during startup began a second concurrent `WhisperKit(config)`, and two downloads wrote the same incomplete file. All loading paths now share a single task: measured 6 concurrent calls resulting in exactly 1 model load.
+- **A frozen decode permanently consumed a thread.** Abandoned inference tasks stayed on Swift's cooperative pool, and after a few hangs the whole app stopped responding. Inference now runs off the cooperative pool, the watchdog timer is cancelled on success, and a timed-out pipeline is discarded rather than reused.
+- **Wrong clipboard content pasted into slow apps.** The 250 ms fixed delay before restoring the clipboard let slow targets paste the previous content. Restoration now waits for the target to consume the text, is skipped entirely if you copied something in the meantime, and never replays password-manager entries marked concealed or transient.
+- **The paste fallback chain was unreachable.** `postCmdV` always reported success, so AppleScript was never attempted and the HUD claimed "pasted" when nothing had been. Success is now determined from the actual target state.
+- **A phrase could vanish during streaming.** Two locks guarded the segment chain, so a natural cut and the final flush could run in parallel and one result was dropped without any error. The chain is now a single critical section and every task is awaited.
+- **Legitimate speech mangled by the anti-repetition guard.** "06 44 44 44 44" collapsed to "06 44" and "non non non" to "non". Numeric tokens are exempt, thresholds are raised, and the mid-decode abort only fires when the text stops progressing.
+- **Glossary rewrote real words.** "gel" became "GYL", "dandy" became "Gandy". Fuzzy matching now scales with term length and never touches a word the system dictionary recognises.
+- **HUD appeared on the wrong display** on multi-monitor setups, and reported a paste that had not happened.
+
+### Added
+
+- **Permission dashboard** in Preferences: live state of Microphone, Accessibility, and Automation, direct links to the right settings pane, and a repair action for a desynchronised TCC entry.
+- **Accessibility prompt at launch** when the permission is missing, with automatic reinstallation of the hotkey monitors the moment it is granted. Previously the app just sat there, silent.
+- **Warning banner** when the app runs from quarantine or outside /Applications, the two situations where macOS silently drops its permissions.
+- **Microphone picker** in Preferences, so a Bluetooth headset or a virtual device connecting mid-session cannot hijack the input.
+- **Engine status** surfaced in Preferences and in the HUD, including model download progress.
+- **Optional update check**, off by default. One request per day to the GitHub releases API, which only ever opens the release page. Nothing is downloaded or installed automatically.
+- **`install.sh`**, a one-line installer that verifies the bundle signature against the project certificate before copying, and avoids the Gatekeeper prompt entirely.
+- **Single-instance guard**: a second copy of the app now steps aside instead of double-pasting every dictation.
+- **22 unit tests** covering the text cleanup logic, in a `VoxPromptCore` library so they can actually run under `swift test`.
+
+### Changed
+
+- `build.sh` verifies the signature, the entitlements and the designated requirement before finishing, and no longer falls back to ad-hoc signing, which was itself a cause of lost permissions. `--install` quits the running instance before replacing it, since replacing a running bundle invalidates its signature at runtime.
+- `package-dmg.sh` refuses to build a DMG from an unverified bundle and ships an installation note.
+- Forced streaming cuts now land on the quietest point of the last second instead of mid-word.
+- Compute profile cache is keyed by macOS build AND model, expires after 14 days, and requires two consecutive timeouts before persisting a downgrade.
+
+### Known limitation
+
+- Glossary terms cannot be injected as decoder prompt tokens. Measured on WhisperKit 0.18: beyond two forced prompt tokens the decoder immediately predicts end-of-transcript and returns an empty segment, regardless of content or decoding options. Glossary correction therefore runs after transcription, and prompt injection stays disabled with the measurement documented in the code.
+
 ## [0.2.0] - 2026-08-02
 
 Feature release: **streaming transcription**. Until now the entire clip was transcribed after key release (batch). The audio stream is now segmented on natural pauses (250 ms of silence, segments between 2.5 s and 12 s) and each segment is transcribed in the background **while the user is still speaking**. On key release only the last segment remains to transcribe, so perceived latency drops from "duration-of-dictation-dependent" to roughly the duration of the last sentence.
@@ -21,14 +63,14 @@ Feature release: **streaming transcription**. Until now the entire clip was tran
 
 ## [0.1.5] - 2026-06-03
 
-Reliability release: after upgrading to macOS 26.5.1, dictation would hang forever ("transcription à l'infini") — the HUD stayed in "transcribing" and never returned. Root-caused by isolating the WhisperKit compute backends on the machine: with the Turbo model on macOS 26.5.1, CoreML inference **deadlocks on both the Apple Neural Engine and the GPU/Metal** (decoder frozen, 30s+ with zero tokens emitted), and only the **CPU** backend decodes correctly. The 0.1.4 anti-loop `DecodingOptions` recipe couldn't help because the decoder never even reached the token-generation stage. This release moves inference to CPU and adds independent safety nets.
+Reliability release: after upgrading to macOS 26.5.1, dictation would hang forever ("transcription à l'infini"), the HUD stayed in "transcribing" and never returned. Root-caused by isolating the WhisperKit compute backends on the machine: with the Turbo model on macOS 26.5.1, CoreML inference **deadlocks on both the Apple Neural Engine and the GPU/Metal** (decoder frozen, 30s+ with zero tokens emitted), and only the **CPU** backend decodes correctly. The 0.1.4 anti-loop `DecodingOptions` recipe couldn't help because the decoder never even reached the token-generation stage. This release moves inference to CPU and adds independent safety nets.
 
 ### Fixed
 
-- **Dictation hanging forever on macOS 26.5.1 (root cause).** WhisperKit defaults the audio encoder and text decoder to `.cpuAndNeuralEngine`; both the ANE and the GPU (`.cpuAndGPU`) deadlock natively on this OS for the Turbo model. The pipeline now pins every stage (`melCompute`, `audioEncoderCompute`, `textDecoderCompute`, `prefillCompute`) to `.cpuOnly`, the only backend verified to decode. Measured steady-state latency on CPU is ~2s for a short dictation — perfectly usable.
+- **Dictation hanging forever on macOS 26.5.1 (root cause).** WhisperKit defaults the audio encoder and text decoder to `.cpuAndNeuralEngine`; both the ANE and the GPU (`.cpuAndGPU`) deadlock natively on this OS for the Turbo model. The pipeline now pins every stage (`melCompute`, `audioEncoderCompute`, `textDecoderCompute`, `prefillCompute`) to `.cpuOnly`, the only backend verified to decode. Measured steady-state latency on CPU is ~2s for a short dictation, perfectly usable.
 - **First-dictation lag.** CPU inference pays a one-time CoreML graph-compilation cost (~8s) on the first decode. The launch warmup now decodes 2s of low-amplitude white noise (`sampleLength: 4`, VAD off) to force that compilation up front, so the user's first real dictation is already fast (~2s) instead of stalling.
 
-### Added — defense in depth (independent of the OS bug)
+### Added: defense in depth (independent of the OS bug)
 
 - **Watchdog timeout.** Transcription runs under `runWithTimeout` (a `withCheckedThrowingContinuation` racing the decode against `max(20s, audioSeconds × 5)`). If a decode ever freezes again, the continuation is resolved by the timeout, the frozen task is abandoned, and the HUD recovers with "Trop long, réessaye" instead of spinning forever. Unlike a `TaskGroup`, this does not re-block waiting on the frozen child.
 - **In-callback loop detection** (`isRepetitionLoop`) and **final-text repetition collapse** (`collapseRepetitions`) for the distinct token-repetition failure mode: a 1-to-6-word pattern repeating is cut at the source mid-decode and/or collapsed in the final text, while a deliberate doubling ("très très bien") is preserved.
@@ -44,7 +86,7 @@ Reliability release: fixes two issues surfaced after upgrading to macOS 26.5. Fi
 ### Fixed
 
 - **Cold-start "Mic KO" right after boot.** At boot, the CoreAudio HAL daemon and TCC subsystem take a moment to settle. The first `AVAudioEngine.start()` after launch-at-login would race that warmup window and fail with an opaque `OSStatus`, leaving the engine in a broken state until the app was relaunched manually. VoxPrompt now arms the input audio unit off the main thread ~600 ms after launch (one start/stop cycle through `engine.prepare()` + `engine.start()` + `engine.stop()`), so the first user hotkey runs against an already-warm unit. If the start still throws, the engine is rebuilt and the call is retried once after a 250 ms delay.
-- **Whisper decoder loops on Turbo (macOS 26.x).** At `temperature: 0.0` with `withoutTimestamps: false`, the greedy decoder has no escape hatch when it falls into a token-repetition cycle — the HUD then stays in "transcribing" forever. The `DecodingOptions` now follow the standard Whisper anti-loop recipe: `withoutTimestamps: true`, explicit `temperatureFallbackCount: 3`, `compressionRatioThreshold: 2.4`, `logProbThreshold: -1.0`, `noSpeechThreshold: 0.6`. The decoder now retries the segment at a higher temperature whenever the output compresses too well (signature of repeated tokens) or the average log-probability collapses.
+- **Whisper decoder loops on Turbo (macOS 26.x).** At `temperature: 0.0` with `withoutTimestamps: false`, the greedy decoder has no escape hatch when it falls into a token-repetition cycle, the HUD then stays in "transcribing" forever. The `DecodingOptions` now follow the standard Whisper anti-loop recipe: `withoutTimestamps: true`, explicit `temperatureFallbackCount: 3`, `compressionRatioThreshold: 2.4`, `logProbThreshold: -1.0`, `noSpeechThreshold: 0.6`. The decoder now retries the segment at a higher temperature whenever the output compresses too well (signature of repeated tokens) or the average log-probability collapses.
 
 ### Changed
 
@@ -110,7 +152,7 @@ Reliability release: fixes the auto-paste path that did not consistently insert 
 - `Paster` is now `@MainActor`-isolated for its public entry point and uses `Task.detached` only for the synchronous `NSAppleScript.executeAndReturnError` call.
 - Pasteboard save/restore uses the full `(NSPasteboard.PasteboardType, Data)` tuple list, not just the string representation, so rich content (RTF, image, file URLs) is preserved across dictations.
 
-## [0.1.0] — 2026-04-18
+## [0.1.0] - 2026-04-18
 
 First public release.
 
