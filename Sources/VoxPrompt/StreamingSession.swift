@@ -30,21 +30,37 @@ final class StreamingSession {
     private var finished = false
     private var segmentCount = 0
 
-    // Découpage : une pause de 250 ms coupe un segment d'au moins 2,5 s ; au-delà de 12 s
-    // de parole ininterrompue on coupe quand même (borne la latence du dernier segment et
-    // la mémoire). Le seuil RMS est aligné sur le garde anti-hallucination du batch (0.003),
+    // Découpage : une pause de 250 ms coupe un segment d'au moins 2,5 s ; au-delà d'une
+    // durée de parole ininterrompue (voir `maxSegmentSamples`, adaptée au moteur de calcul)
+    // on coupe quand même, ce qui borne la latence du dernier segment et la mémoire.
+    // Le seuil RMS est aligné sur le garde anti-hallucination du batch (0.003),
     // légèrement relevé car une pause entre deux phrases n'est jamais un silence parfait.
     private static let sampleRate = 16_000
     private static let silenceThreshold: Float = 0.004
     private static let minSilenceSamples = sampleRate / 4        // 250 ms
     private static let minSegmentSamples = sampleRate * 5 / 2    // 2,5 s
-    private static let maxSegmentSamples = sampleRate * 12       // 12 s
+    private static let maxSegmentSecondsFast = 12
+    /// Sur un profil lent, le decodage tourne MOINS VITE que le temps reel (mesure : 9,3 s
+    /// pour 6,5 s d'audio en tout-CPU). Attendre 12 s de parole ininterrompue avant de
+    /// couper reporte alors tout le travail apres le relachement, ce qui annule l'interet
+    /// du streaming. On coupe plus tot pour que le decodage demarre pendant que l'utilisateur
+    /// parle encore, au prix d'un peu de contexte pour le modele.
+    private static let maxSegmentSecondsSlow = 5
     private static let minTailSamples = sampleRate / 4           // tail < 250 ms : rien à dire
     private static let cutWindowSamples = sampleRate / 50        // 20 ms
     private static let cutLookbackSamples = sampleRate           // 1 s
 
+    /// Longueur maximale d'un segment avant coupe forcee, choisie a l'ouverture de la
+    /// session selon le moteur de calcul reellement actif.
+    private let maxSegmentSamples: Int
+
     init(transcriber: Transcriber) {
         self.transcriber = transcriber
+        // Le profil retenu par le Transcriber est memorise par build macOS et par modele.
+        // `cpu-only` signifie que le bug CoreML d'Apple nous prive de l'ANE et du GPU.
+        let profile = UserDefaults.standard.string(forKey: "whisper.computeProfile.v2.id")
+        let seconds = (profile == "cpu-only") ? Self.maxSegmentSecondsSlow : Self.maxSegmentSecondsFast
+        self.maxSegmentSamples = Self.sampleRate * seconds
     }
 
     /// Appelé par l'AudioRecorder pour chaque buffer converti (thread du tap audio).
@@ -64,7 +80,7 @@ final class StreamingSession {
         }
 
         let naturalCut = pending.count >= Self.minSegmentSamples && silentRun >= Self.minSilenceSamples
-        let forcedCut = pending.count >= Self.maxSegmentSamples
+        let forcedCut = pending.count >= maxSegmentSamples
         guard naturalCut || forcedCut else { lock.unlock(); return }
 
         let isForced = forcedCut && !naturalCut
