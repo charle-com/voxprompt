@@ -54,9 +54,11 @@ echo "==> VoxPrompt ${VERSION} (build ${BUILD_NUMBER})"
 # ---------------------------------------------------------------- compilation
 
 echo "==> Compilation Swift (release, arm64)…"
-"${SWIFT_BIN}" build -c release --arch arm64
+# --product : seul l'executable de l'app est necessaire ici. Le banc de mesure
+# voxbench est un outil de developpement, inutile de le construire a chaque livraison.
+"${SWIFT_BIN}" build -c release --arch arm64 --product "${APP_NAME}"
 
-BIN_PATH="$("${SWIFT_BIN}" build -c release --arch arm64 --show-bin-path)/${APP_NAME}"
+BIN_PATH="$("${SWIFT_BIN}" build -c release --arch arm64 --product "${APP_NAME}" --show-bin-path)/${APP_NAME}"
 [[ -x "${BIN_PATH}" ]] || fail "Binaire introuvable : ${BIN_PATH}"
 
 # ---------------------------------------------------------------- bundle

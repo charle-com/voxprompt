@@ -39,22 +39,43 @@ actor Transcriber {
         // Anciennes clés (v1), lues une seule fois pour la migration.
         static let legacyProfile = "whisper.computeProfile"
         static let legacyOSBuild = "whisper.computeProfileOSBuild"
-        // Clés v2 : le profil n'est valable que pour un couple (build macOS, modèle).
-        static let profileID = "whisper.computeProfile.v2.id"
-        static let profileOSBuild = "whisper.computeProfile.v2.osBuild"
-        static let profileModel = "whisper.computeProfile.v2.model"
-        static let profileDate = "whisper.computeProfile.v2.date"
+        // Clés v3 : le profil n'est valable que pour un couple (build macOS, modèle).
+        // Le passage de v2 à v3 invalide volontairement tous les verdicts existants :
+        // le profil « tout Neural Engine » n'existait pas quand ils ont été rendus, et
+        // le budget de chargement à froid était trop court pour que l'ANE puisse gagner
+        // (compilation CoreML mesurée à 155 s au tout premier chargement, contre 180 s
+        // de watchdog). Tout le monde re-sonde donc une fois, depuis le plus rapide.
+        static let profileID = "whisper.computeProfile.v3.id"
+        static let profileOSBuild = "whisper.computeProfile.v3.osBuild"
+        static let profileModel = "whisper.computeProfile.v3.model"
+        static let profileDate = "whisper.computeProfile.v3.date"
+        /// Préfixe des marqueurs « ce triplet (build macOS, modèle, profil) a déjà été
+        /// compilé avec succès », qui font passer le chargement au watchdog court.
+        static let compiledPrefix = "whisper.compiled.v3."
         // Probation : on ne persiste une dégradation qu'après 2 timeouts consécutifs.
-        static let probationID = "whisper.computeProfile.v2.probationID"
-        static let probationCount = "whisper.computeProfile.v2.probationCount"
+        static let probationID = "whisper.computeProfile.v3.probationID"
+        static let probationCount = "whisper.computeProfile.v3.probationCount"
     }
 
     /// Au-delà, on re-sonde depuis le profil le plus rapide : Apple a pu corriger
     /// l'inférence entre-temps sans changer de build (mise à jour de firmware ANE,
     /// recompilation du cache CoreML), et un profil dégradé coûte cher en latence.
     private static let profileMaxAge: TimeInterval = 14 * 24 * 3600
-    /// Watchdog du chargement (compilation CoreML incluse), hors téléchargement.
-    private static let loadTimeoutSeconds: Double = 180
+    /// Watchdog du chargement, une fois le graphe déjà compilé : à ce stade l'instanciation
+    /// prend une poignée de secondes, et tout ce qui traîne est une vraie panne.
+    private static let loadTimeoutSeconds: Double = 120
+
+    /// Watchdog du TOUT PREMIER chargement d'un graphe donné, compilation comprise.
+    ///
+    /// La première instanciation d'un modèle sur le Neural Engine déclenche une compilation
+    /// ahead-of-time (`E5RT::E5CompilerImpl::Compile`, visible dans un `sample` du process),
+    /// mesurée entre 2 et 5 minutes sur un MacBook Air ; les lancements suivants repartent
+    /// du cache système en 1 à 2 s. L'ancien budget unique de 180 s tombait en plein dedans :
+    /// le sondage prenait un compilateur au travail pour un décodeur figé, écartait l'ANE,
+    /// et l'app restait verrouillée sur le repli tout-CPU, 27× plus lent, jusqu'à la
+    /// prochaine mise à jour de macOS. D'où deux budgets : large tant que le graphe n'a
+    /// jamais été compilé, serré ensuite.
+    private static let firstLoadTimeoutSeconds: Double = 900
     /// Watchdog du décodage de bruit (warmup / sondage).
     private static let warmTimeoutSeconds: Double = 60
 
@@ -101,19 +122,30 @@ actor Transcriber {
 
     /// Profils candidats, du plus rapide au plus sûr.
     ///
-    /// Contexte : sur macOS 26.5.x, l'inférence CoreML du DÉCODEUR Whisper se fige
-    /// (deadlock natif : décodeur gelé avant le moindre token) à la fois sur l'Apple
-    /// Neural Engine et sur le GPU/Metal. L'ENCODEUR audio, lui, n'est pas touché. Or
-    /// c'est l'encodeur le composant lourd (≈85 % du temps de transcription sur CPU,
-    /// mesuré : ~6 s pour 12 s d'audio, le décodage ne prenant que ~1 s). On remet donc
-    /// l'encodeur sur le matériel rapide et on garde le décodeur (et le prefill) sur CPU.
-    /// Si même l'encodeur déraille, on retombe sur GPU puis sur tout-CPU.
+    /// Historique : de mai à août 2026, l'inférence CoreML du DÉCODEUR Whisper se figeait
+    /// sur macOS 26.5.x (deadlock natif, décodeur gelé avant le moindre token) sur l'Apple
+    /// Neural Engine comme sur le GPU. D'où un jeu de profils qui n'osait mettre que
+    /// l'ENCODEUR sur le matériel rapide, décodeur épinglé sur CPU.
+    ///
+    /// MESURE du 20/08/2026 sur macOS 26.5.2 (25F84), Turbo 632 Mo, 32,4 s de parole
+    /// française, transcription en un seul passage :
+    ///
+    ///     tout CPU                        50,1 s   (avec segments de 5 s : le pire cas)
+    ///     tout CPU, un seul passage       12,6 s
+    ///     encodeur ANE + décodeur CPU      8,6 s
+    ///     tout Neural Engine               1,9 s   <- plus aucun deadlock
+    ///
+    /// Le décodeur ne se fige plus. Le profil « tout ANE » est donc réintroduit en tête,
+    /// et c'est lui qui doit gagner : 27× plus rapide que le repli tout-CPU.
     ///
     /// Le profil retenu est mémorisé PAR BUILD macOS ET PAR MODÈLE : un profil validé sur
-    /// Turbo ne prouve rien pour Large v3 (graphes CoreML différents). Le jour où Apple
-    /// corrige l'inférence (nouveau build), le cache est invalidé, on re-teste depuis le
-    /// plus rapide et l'app reprend automatiquement le plein régime, sans intervention.
+    /// Turbo ne prouve rien pour Large v3 (graphes CoreML différents). Si Apple casse à
+    /// nouveau l'inférence (nouveau build), le cache est invalidé, on re-teste depuis le
+    /// plus rapide et l'app se rabat toute seule sur le profil qui décode.
     static let profiles: [ComputeProfile] = [
+        ComputeProfile(id: "ane-full", label: "Neural Engine",
+                       mel: .cpuOnly, audioEncoder: .cpuAndNeuralEngine,
+                       textDecoder: .cpuAndNeuralEngine, prefill: .cpuAndNeuralEngine),
         ComputeProfile(id: "ane-encoder", label: "encodeur Neural Engine + décodeur CPU",
                        mel: .cpuOnly, audioEncoder: .cpuAndNeuralEngine, textDecoder: .cpuOnly, prefill: .cpuOnly),
         ComputeProfile(id: "gpu-encoder", label: "encodeur GPU + décodeur CPU",
@@ -122,33 +154,64 @@ actor Transcriber {
                        mel: .cpuOnly, audioEncoder: .cpuOnly, textDecoder: .cpuOnly, prefill: .cpuOnly),
     ]
 
+    /// Profils dont le débit suffit à transcrire plus vite que le temps réel. En dessous,
+    /// découper la dictée en segments coûte PLUS cher que de tout décoder d'un coup :
+    /// Whisper encode une fenêtre de 30 s quelle que soit la longueur réelle du segment,
+    /// donc chaque coupe rachète un encodage complet (mesuré : 7 segments de 5 s = 50,1 s
+    /// contre 12,6 s en un passage, pour le même audio).
+    static let fastProfileIDs: Set<String> = ["ane-full", "ane-encoder", "gpu-encoder"]
+
+    /// Dernier profil réellement chargé, lisible hors de l'acteur. La capture audio doit
+    /// savoir AVANT de démarrer si le moteur tient le temps réel, et elle ne peut pas
+    /// `await` sur l'acteur sans retarder l'ouverture du micro. Retombe sur le verdict
+    /// persisté tant qu'aucun pipeline n'a été chargé dans cette session.
+    private static let activeProfileBox = ActiveProfileBox()
+
+    /// Vrai si le moteur décode plus vite que le temps réel, donc si découper la dictée
+    /// en segments a un sens. Faux sur repli CPU : voir `fastProfileIDs`.
+    nonisolated static var engineKeepsUpWithRealtime: Bool {
+        let id = activeProfileBox.value ?? UserDefaults.standard.string(forKey: Keys.profileID)
+        // Aucun verdict connu (tout premier lancement) : on parie sur le matériel, qui
+        // est le cas de très loin le plus fréquent. Un mauvais pari coûte une dictée.
+        guard let id else { return true }
+        return fastProfileIDs.contains(id)
+    }
+
+    /// Boîte atomique minuscule : un `static var` mutable n'est pas concurrency-safe.
+    private final class ActiveProfileBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: String?
+        var value: String? {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
+        }
+    }
+
     private static func profile(byID id: String?) -> ComputeProfile? {
         guard let id else { return nil }
         return profiles.first { $0.id == id }
     }
 
-    /// Migre les clés v1 vers v2. Le profil v1 avait été validé avec le modèle
-    /// actuellement configuré : on le lui attribue, et on lui donne la date du jour pour
-    /// ne pas déclencher un re-sondage immédiat au premier lancement de cette version.
-    private static func migrateLegacyKeysIfNeeded(model: String) {
+    /// Efface les verdicts des générations précédentes. On ne les MIGRE PAS : ils ont été
+    /// rendus sur une liste de candidats qui ne contenait pas « tout Neural Engine » et
+    /// avec un budget de chargement trop court pour lui. Les hériter reconduirait le repli
+    /// tout-CPU à l'infini. Un re-sondage coûte une compilation CoreML une seule fois.
+    private static func dropLegacyKeysIfNeeded() {
         let d = UserDefaults.standard
-        guard d.string(forKey: Keys.profileID) == nil else { return }
-        guard let legacyID = d.string(forKey: Keys.legacyProfile),
-              let legacyBuild = d.string(forKey: Keys.legacyOSBuild),
-              profile(byID: legacyID) != nil else { return }
-        d.set(legacyID, forKey: Keys.profileID)
-        d.set(legacyBuild, forKey: Keys.profileOSBuild)
-        d.set(model, forKey: Keys.profileModel)
-        d.set(Date().timeIntervalSince1970, forKey: Keys.profileDate)
-        d.removeObject(forKey: Keys.legacyProfile)
-        d.removeObject(forKey: Keys.legacyOSBuild)
-        VPLog.log("migration cache profil v1 → v2 (\(legacyID), build \(legacyBuild), modèle \(model))")
+        let stale = [Keys.legacyProfile, Keys.legacyOSBuild,
+                     "whisper.computeProfile.v2.id", "whisper.computeProfile.v2.osBuild",
+                     "whisper.computeProfile.v2.model", "whisper.computeProfile.v2.date",
+                     "whisper.computeProfile.v2.probationID", "whisper.computeProfile.v2.probationCount"]
+        let present = stale.filter { d.object(forKey: $0) != nil }
+        guard !present.isEmpty else { return }
+        present.forEach { d.removeObject(forKey: $0) }
+        VPLog.log("cache de profil des versions précédentes effacé (\(present.count) clé(s)) : re-sondage")
     }
 
     /// Profil déjà validé pour CE build macOS ET CE modèle, et pas trop ancien.
     /// `nil` = il faut (re)sonder.
     private static func cachedProfile(model: String) -> ComputeProfile? {
-        migrateLegacyKeysIfNeeded(model: model)
+        dropLegacyKeysIfNeeded()
         let d = UserDefaults.standard
         guard d.string(forKey: Keys.profileOSBuild) == osBuild() else { return nil }
         guard d.string(forKey: Keys.profileModel) == model else { return nil }
@@ -160,6 +223,19 @@ actor Transcriber {
             return nil
         }
         return profile(byID: d.string(forKey: Keys.profileID))
+    }
+
+    /// Le graphe CoreML de ce triplet a-t-il déjà été compilé une fois sur cette machine ?
+    private static func graphAlreadyCompiled(model: String, profile: ComputeProfile) -> Bool {
+        UserDefaults.standard.bool(forKey: compiledKey(model: model, profile: profile))
+    }
+
+    private static func markGraphCompiled(model: String, profile: ComputeProfile) {
+        UserDefaults.standard.set(true, forKey: compiledKey(model: model, profile: profile))
+    }
+
+    private static func compiledKey(model: String, profile: ComputeProfile) -> String {
+        "\(Keys.compiledPrefix)\(osBuild()).\(model).\(profile.id)"
     }
 
     private static func persistProfile(_ p: ComputeProfile, model: String) {
@@ -302,9 +378,15 @@ actor Transcriber {
             statusBox.emit(.loading)
             do {
                 let t0 = Date()
-                let kit = try await runIsolated(timeout: Self.loadTimeoutSeconds) {
+                let alreadyCompiled = Self.graphAlreadyCompiled(model: model, profile: p)
+                let budget = alreadyCompiled ? Self.loadTimeoutSeconds : Self.firstLoadTimeoutSeconds
+                if !alreadyCompiled {
+                    VPLog.log("première compilation du graphe \(p.id) : budget \(Int(budget)) s")
+                }
+                let kit = try await runIsolated(timeout: budget) {
                     try await Self.makePipeline(model: model, folder: folder, profile: p)
                 }
+                Self.markGraphCompiled(model: model, profile: p)
                 guard loadGeneration == id else { throw CancellationError() }
                 VPLog.log(String(format: "pipeline init done in %.2fs (compute=%@)", Date().timeIntervalSince(t0), p.id))
 
@@ -319,6 +401,7 @@ actor Transcriber {
 
                 pipeline = kit
                 activeProfile = p
+                Self.activeProfileBox.value = p.id
                 loadedModel = model
                 lastUsed = Date()
                 // On ne rafraîchit PAS la date sur un simple hit de cache : c'est elle qui

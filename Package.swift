@@ -23,6 +23,15 @@ let package = Package(
             ],
             path: "Sources/VoxPrompt"
         ),
+        // Banc de mesure du cout de transcription selon la taille des segments.
+        // Outil de developpement, pas embarque dans l'app.
+        .executableTarget(
+            name: "voxbench",
+            dependencies: [
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
+            ],
+            path: "Sources/voxbench"
+        ),
         .testTarget(
             name: "VoxPromptCoreTests",
             dependencies: ["VoxPromptCore"],

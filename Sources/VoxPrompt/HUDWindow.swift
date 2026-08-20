@@ -4,8 +4,10 @@ import Combine
 
 enum HUDState: Equatable {
     case idle
-    case recording
-    case transcribing
+    /// `pending` : dictées déjà relâchées qui attendent encore d'être transcrites ou
+    /// collées. Non nul quand l'utilisateur enchaîne un vocal sans attendre le précédent.
+    case recording(pending: Int)
+    case transcribing(pending: Int)
     /// Telechargement du modele Whisper au premier usage ou apres un changement de modele.
     /// Progression de 0 a 1, ou nil quand la taille totale n'est pas connue.
     case downloading(progress: Double?)
@@ -24,6 +26,21 @@ final class HUDController {
     private var hideTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
+    /// Etat a retrouver quand un message ephemere expire. Sans lui, le HUD se cache apres
+    /// un « Colle » alors qu'une autre dictee est encore en file : le travail en cours
+    /// devenait invisible. `nil` = plus rien a montrer, on cache.
+    private var background: HUDState?
+
+    /// Definit l'etat de fond SANS l'afficher tout de suite. Un message ephemere en cours
+    /// garde la main jusqu'a son expiration, puis cede la place a ce fond.
+    func setBackground(_ state: HUDState?) {
+        background = state
+        // Aucun message ephemere en attente : le fond prend effet immediatement.
+        if hideTask == nil {
+            if let state { show(state: state, asBackground: true) } else { hide() }
+        }
+    }
+
     func bindLevels(_ publisher: AnyPublisher<Float, Never>) {
         publisher.receive(on: RunLoop.main).sink { [weak self] in
             self?.levelSubject.send($0)
@@ -31,7 +48,13 @@ final class HUDController {
     }
 
     func show(state newState: HUDState) {
+        show(state: newState, asBackground: false)
+    }
+
+    private func show(state newState: HUDState, asBackground: Bool) {
         hideTask?.cancel()
+        hideTask = nil
+        if asBackground { background = newState }
         if window == nil { buildWindow() }
         state.send(newState)
 
@@ -52,12 +75,26 @@ final class HUDController {
         if let delay {
             hideTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                if !Task.isCancelled { self?.hide() }
+                guard !Task.isCancelled, let self else { return }
+                self.hideTask = nil
+                // Retour au travail de fond s'il en reste, sinon on s'efface.
+                if let background = self.background {
+                    self.show(state: background, asBackground: true)
+                } else {
+                    self.hide()
+                }
             }
+        } else {
+            background = newState
         }
     }
 
-    func hide() { window?.orderOut(nil) }
+    func hide() {
+        hideTask?.cancel()
+        hideTask = nil
+        background = nil
+        window?.orderOut(nil)
+    }
 
     private func buildWindow() {
         let rect = NSRect(x: 0, y: 0, width: HUDState.idle.preferredWidth, height: 52)
@@ -112,7 +149,8 @@ private extension HUDState {
     /// « J'ecoute » ou « Colle ».
     var preferredWidth: CGFloat {
         switch self {
-        case .idle, .recording, .transcribing, .done: return 240
+        case .idle, .done: return 240
+        case .recording(let pending), .transcribing(let pending): return pending > 0 ? 268 : 240
         case .downloading: return 260
         case .clipboard, .error: return 320
         }
@@ -243,8 +281,10 @@ private struct HUDView: View {
     private var subtitle: String {
         switch observer.state {
         case .idle: return ""
-        case .recording: return "relâche pour transcrire"
-        case .transcribing: return "whisper"
+        case .recording(let pending):
+            return pending > 0 ? "\(pending) en attente derrière" : "relâche pour transcrire"
+        case .transcribing(let pending):
+            return pending > 0 ? "\(pending) autre(s) en file" : "whisper"
         case .downloading(let progress):
             guard let progress else { return "modèle Whisper" }
             return "\(Int(progress * 100)) %"

@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import AVFoundation
 import Combine
+import VoxPromptCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -14,10 +15,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let paster = Paster()
     private var streaming: StreamingSession?
 
-    /// Vrai de l'appui sur la touche jusqu'a la fin du collage. Sans ce verrou, un second
-    /// appui pendant une transcription fait se chevaucher deux cycles : les deux sauvegardes
-    /// du presse-papier se croisent et la cible recoit l'ancien contenu au lieu du texte dicte.
-    private var dictationInFlight = false
+    /// Dictees relachees qui restent a transcrire et a coller, dans l'ordre d'enregistrement.
+    /// La capture n'attend PAS la transcription : relacher la touche depose la prise ici et
+    /// rend la main tout de suite, on peut donc enchainer un second vocal immediatement.
+    /// Voir `DictationQueue` pour la garantie d'ordre et le consommateur unique.
+    private var queue = DictationQueue<DictationJob>(capacity: 8)
+    private var jobCounter = 0
+
+    /// Une prise terminee, prete a etre transcrite puis collee.
+    private struct DictationJob {
+        let id: Int
+        /// Session de transcription au fil de l'eau, quand le moteur tient le temps reel.
+        let session: StreamingSession?
+        /// WAV complet, toujours ecrit : c'est le repli si le streaming echoue.
+        let url: URL
+        /// Application visee par le collage, capturee a l'appui sur la touche.
+        let target: NSRunningApplication?
+        let recordedAt: Date
+    }
 
     /// Surveillance de l'accessibilite tant qu'elle manque. Les moniteurs clavier globaux
     /// n'emettent rien sans elle, et macOS ne previent pas quand l'utilisateur l'accorde :
@@ -145,8 +160,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.streaming = nil
-                self.dictationInFlight = false
-                self.hud.show(state: .error(message: "Micro déconnecté"))
+                self.recordingStartedAt = nil
+                self.showTransient(.error(message: "Micro déconnecté"))
                 VPLog.log("input device lost during recording")
             }
         }
@@ -161,7 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in await self?.transcriber.keepWarm() }
         }
         hotkey.onRelease = { [weak self] target in
-            Task { @MainActor in await self?.stopAndTranscribe(target: target) }
+            Task { @MainActor in self?.enqueueDictation(target: target) }
         }
         hotkey.start(binding: Settings.shared.hotkey)
     }
@@ -247,9 +262,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Dictee
 
     private func startRecording() {
+        // Seule une prise DEJA en cours bloque : une transcription en vol, elle, n'empeche
+        // plus rien. C'est tout l'objet de la file.
         guard !recorder.isRecording else { return }
-        guard !dictationInFlight else {
-            VPLog.log("dictation already in flight, ignoring hotkey press")
+        guard !queue.isFull else {
+            VPLog.log("queue full (\(queue.count)), refusing new take")
+            showTransient(.error(message: "\(queue.count) dictées en attente"))
             return
         }
 
@@ -267,26 +285,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        dictationInFlight = true
         recordingStartedAt = Date()
-        hud.show(state: .recording)
-        if Settings.shared.streamingEnabled {
+        hud.show(state: .recording(pending: queue.outstanding))
+        // Le decoupage en segments ne se justifie QUE si le moteur decode plus vite que le
+        // temps reel. Sur repli tout-CPU, chaque coupe rachete un encodage de 30 s et le
+        // travail total est multiplie par quatre : on transcrit alors la prise d'un bloc.
+        if Settings.shared.streamingEnabled, Transcriber.engineKeepsUpWithRealtime {
             let session = StreamingSession(transcriber: transcriber)
             streaming = session
             recorder.sampleHandler = { session.ingest($0) }
         } else {
+            if Settings.shared.streamingEnabled {
+                VPLog.log("streaming off for this take: engine slower than realtime")
+            }
             streaming = nil
             recorder.sampleHandler = nil
         }
         do {
             try recorder.start()
         } catch {
-            dictationInFlight = false
             recordingStartedAt = nil
             streaming = nil
             recorder.sampleHandler = nil
             let nsErr = error as NSError
-            hud.show(state: .error(message: Self.recorderMessage(for: nsErr)))
+            showTransient(.error(message: Self.recorderMessage(for: nsErr)))
             VPLog.log("Recorder error: \(error) (domain=\(nsErr.domain) code=\(nsErr.code))")
         }
     }
@@ -304,14 +326,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func stopAndTranscribe(target: NSRunningApplication?) async {
-        // NE PAS liberer le verrou ici. Si on n'enregistre pas, de deux choses l'une :
-        // soit aucun cycle n'est en cours et le verrou est deja libre, soit il appartient
-        // a un cycle encore en vol. C'est le cas du relachement synthetise en double par
-        // le watchdog : le second passage liberait le verrou du premier, l'appui suivant
-        // demarrait par-dessus, et les deux collages s'entrelacaient.
+    /// Fin de prise : ferme l'enregistrement, depose la dictee dans la file et rend la main
+    /// IMMEDIATEMENT. La transcription et le collage se font ensuite en arriere-plan, ce qui
+    /// laisse l'utilisateur reappuyer sur la touche sans attendre.
+    private func enqueueDictation(target: NSRunningApplication?) {
+        // Sans prise en cours, il n'y a rien a deposer. C'est le cas du relachement
+        // synthetise en double par le watchdog de touche.
         guard recorder.isRecording else { return }
-        defer { dictationInFlight = false }
 
         let session = streaming
         streaming = nil
@@ -327,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if duration < 0.35 {
             VPLog.log(String(format: "press too short (%.2fs), dictation discarded", duration))
             try? FileManager.default.removeItem(at: url)
-            hud.hide()
+            syncHUDBackground()
             return
         }
         VPLog.log("stop file=\(url.lastPathComponent) rms=\(rms) target=\(target?.localizedName ?? "?")")
@@ -336,51 +357,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // de fond : on saute la transcription plutot que de coller n'importe quoi.
         if rms < 0.003 {
             VPLog.log("silence detected rms=\(rms) device=\(recorder.lastDeviceName) — skip transcription")
-            hud.show(state: .error(message: "Aucun son (\(recorder.lastDeviceName))"))
+            showTransient(.error(message: "Aucun son (\(recorder.lastDeviceName))"))
             try? FileManager.default.removeItem(at: url)
             return
         }
 
-        hud.show(state: .transcribing)
-        defer { try? FileManager.default.removeItem(at: url) }
+        jobCounter += 1
+        queue.enqueue(DictationJob(id: jobCounter, session: session, url: url,
+                                   target: target, recordedAt: Date()))
+        VPLog.log("dictation #\(jobCounter) queued (\(queue.count) in queue)")
+        syncHUDBackground()
+        startWorkerIfNeeded()
+    }
+
+    /// Vide la file, une dictee a la fois, dans l'ordre de dictee. Un seul exemplaire
+    /// tourne : la file elle-meme n'accorde le role de consommateur qu'une fois, et tout
+    /// se joue sur le main actor, donc sans course.
+    private func startWorkerIfNeeded() {
+        guard queue.claimConsumer() else { return }
+        Task { @MainActor in
+            // `next()` rend le role de consommateur en meme temps que le dernier job :
+            // une prise deposee pendant le dernier collage relancera donc un worker.
+            while let job = queue.next() {
+                await process(job)
+            }
+            // Plus rien derriere : le dernier message ephemere peut s'effacer pour de bon.
+            syncHUDBackground()
+        }
+    }
+
+    /// Transcrit une dictee puis la colle. La prise suivante peut etre en cours
+    /// d'enregistrement pendant ce temps : c'est justement le but.
+    private func process(_ job: DictationJob) async {
+        defer { try? FileManager.default.removeItem(at: job.url) }
+        // Le HUD appartient a la prise en cours quand il y en a une : afficher
+        // "Transcription" par-dessus "J'ecoute" masquerait le niveau du micro.
+        syncHUDBackground()
 
         do {
             // Voie rapide : les segments deja transcrits pendant la dictee, plus la queue.
             // Si un segment a echoue en vol, finish() renvoie nil et on retombe sur le
             // decodage complet du WAV, qui est ecrit en parallele exactement pour ca.
             let text: String
-            if let session, let streamed = await session.finish() {
+            if let session = job.session, let streamed = await session.finish() {
                 text = streamed
             } else {
-                if session != nil { VPLog.log("streaming failed — batch fallback on wav") }
-                text = try await transcriber.transcribe(fileURL: url)
+                if job.session != nil { VPLog.log("streaming failed, batch fallback on wav") }
+                text = try await transcriber.transcribe(fileURL: job.url)
             }
-            VPLog.log("result: \"\(text)\"")
+            VPLog.log(String(format: "dictation #%d done in %.2fs: \"%@\"",
+                             job.id, Date().timeIntervalSince(job.recordedAt), text))
 
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else {
-                hud.show(state: .error(message: "Silence"))
+                showTransient(.error(message: "Silence"))
                 return
             }
-            switch await paster.copyAndPaste(trimmed, targetApp: target) {
+            switch await paster.copyAndPaste(trimmed, targetApp: job.target) {
             case .pasted:
-                hud.show(state: .done)
+                showTransient(.done)
             case .clipboardOnly(let reason):
                 // Le texte n'est pas perdu : il attend un Cmd+V. Ce n'est pas une erreur.
-                hud.show(state: .clipboard(reason: reason))
+                showTransient(.clipboard(reason: reason))
             }
         } catch let e as Transcriber.TranscriberError {
             switch e {
             case .timeout:
-                hud.show(state: .error(message: "Trop long, réessaye"))
+                showTransient(.error(message: "Trop long, réessaye"))
             case .modelUnavailable(let message):
-                hud.show(state: .error(message: message))
+                showTransient(.error(message: message))
             }
             VPLog.log("Transcriber error: \(e)")
         } catch {
-            hud.show(state: .error(message: "Transcription KO"))
+            showTransient(.error(message: "Transcription KO"))
             VPLog.log("Transcriber error: \(error)")
         }
+    }
+
+    // MARK: HUD partage entre la prise et la file
+
+    /// Ce que le HUD doit montrer quand aucun message ephemere n'occupe l'ecran : la prise
+    /// en cours si elle existe (elle a besoin de la waveform), sinon l'avancement de la
+    /// file, sinon rien. Le HUD y revient tout seul apres chaque « Colle » ou erreur.
+    private func syncHUDBackground() {
+        if recorder.isRecording {
+            hud.setBackground(.recording(pending: queue.outstanding))
+        } else if !queue.isSettled {
+            hud.setBackground(.transcribing(pending: queue.count))
+        } else {
+            hud.setBackground(nil)
+        }
+    }
+
+    /// Message a duree de vie courte (colle, erreur, presse-papier). Le fond est declare
+    /// AVANT pour que le HUD sache ou revenir : sans ca il se cacherait alors qu'une autre
+    /// dictee attend encore derriere.
+    private func showTransient(_ state: HUDState) {
+        syncHUDBackground()
+        hud.show(state: state)
     }
 
     @objc private func quit() {

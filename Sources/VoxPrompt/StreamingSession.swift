@@ -38,14 +38,21 @@ final class StreamingSession {
     private static let sampleRate = 16_000
     private static let silenceThreshold: Float = 0.004
     private static let minSilenceSamples = sampleRate / 4        // 250 ms
-    private static let minSegmentSamples = sampleRate * 5 / 2    // 2,5 s
-    private static let maxSegmentSecondsFast = 12
-    /// Sur un profil lent, le decodage tourne MOINS VITE que le temps reel (mesure : 9,3 s
-    /// pour 6,5 s d'audio en tout-CPU). Attendre 12 s de parole ininterrompue avant de
-    /// couper reporte alors tout le travail apres le relachement, ce qui annule l'interet
-    /// du streaming. On coupe plus tot pour que le decodage demarre pendant que l'utilisateur
-    /// parle encore, au prix d'un peu de contexte pour le modele.
-    private static let maxSegmentSecondsSlow = 5
+    /// Segment minimal AVANT qu'une pause ait le droit de couper.
+    ///
+    /// MESURE du 20/08/2026 (32,4 s de parole française, Turbo, macOS 26.5.2) : Whisper
+    /// encode une fenêtre de 30 s quelle que soit la durée réelle du segment, donc chaque
+    /// coupe rachète un encodage complet. Découper court est un marché de dupes :
+    ///
+    ///     un seul passage            tout-ANE 1,9 s | tout-CPU 12,6 s
+    ///     segments de 15 s           tout-ANE 2,4 s | tout-CPU 39,5 s
+    ///     segments de  5 s           tout-ANE 8,9 s | tout-CPU 50,1 s
+    ///
+    /// Le seuil de 2,5 s hérité de la v0.2.0 multipliait donc le travail par quatre. On
+    /// laisse maintenant les segments s'allonger jusqu'à approcher la fenêtre de 30 s que
+    /// le modèle paye de toute façon.
+    private static let minSegmentSamples = sampleRate * 12       // 12 s
+    private static let maxSegmentSeconds = 24
     private static let minTailSamples = sampleRate / 4           // tail < 250 ms : rien à dire
     private static let cutWindowSamples = sampleRate / 50        // 20 ms
     private static let cutLookbackSamples = sampleRate           // 1 s
@@ -56,11 +63,7 @@ final class StreamingSession {
 
     init(transcriber: Transcriber) {
         self.transcriber = transcriber
-        // Le profil retenu par le Transcriber est memorise par build macOS et par modele.
-        // `cpu-only` signifie que le bug CoreML d'Apple nous prive de l'ANE et du GPU.
-        let profile = UserDefaults.standard.string(forKey: "whisper.computeProfile.v2.id")
-        let seconds = (profile == "cpu-only") ? Self.maxSegmentSecondsSlow : Self.maxSegmentSecondsFast
-        self.maxSegmentSamples = Self.sampleRate * seconds
+        self.maxSegmentSamples = Self.sampleRate * Self.maxSegmentSeconds
     }
 
     /// Appelé par l'AudioRecorder pour chaque buffer converti (thread du tap audio).

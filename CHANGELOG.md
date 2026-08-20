@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-20
+
+Speed release. Dictation is transcribed on the Neural Engine again, 27x faster than the CPU fallback the app had been stuck on, and releasing the key no longer blocks the next dictation: takes queue up and are pasted back to back, in order.
+
+### Fixed
+
+- **The app was locked onto the slowest compute profile.** macOS 26.5.x used to deadlock CoreML inference on the Neural Engine, so VoxPrompt pinned the decoder to the CPU and, when even the encoder froze, fell back to running everything on the CPU. That is no longer true on build 25F84. Measured on 32.4 s of French speech with the Turbo model, single pass: all-CPU 12.6 s, ANE encoder + CPU decoder 8.6 s, **all Neural Engine 1.9 s**. A `ane-full` profile is now probed first, and it wins.
+- **The profile probe mistook a compiler for a deadlock.** The first instantiation of a Neural Engine graph runs an ahead-of-time compilation (`E5RT::E5CompilerImpl::Compile`, visible in a `sample` of the process) that takes 155 to 165 s on a MacBook Air, against a watchdog budget of 180 s. On a busy machine the probe timed out, blamed the hardware, and persisted that verdict per macOS build, leaving the app 27x slower until the next OS update. The budget is now 900 s for the first compilation of a given graph and 120 s afterwards, once the system cache makes loading a 2 s affair. Cached verdicts from previous versions are discarded rather than migrated, so every install re-probes once with the full candidate list.
+- **Chopping a dictation into short segments cost more than it saved.** Whisper encodes a 30 s window whatever the real length of the segment, so every cut buys another full encode. Measured on the same 32.4 s clip: one pass 12.6 s, 15 s segments 39.5 s, 5 s segments 50.1 s. The 5 s forced cut shipped in 1.0.0 was the worst possible setting. Segments now run 12 to 24 s, and streaming is skipped entirely when the engine cannot keep up with real time, in which case the take is decoded in one go.
+
+### Added
+
+- **Dictation queue.** Releasing the key used to hold a lock until the paste was done, so a second dictation started in the meantime was simply ignored. Takes are now handed to a FIFO queue and the microphone is free again immediately: you can chain vocal after vocal while earlier ones are still being transcribed. A single consumer drains the queue, which keeps the pastes in dictation order and stops two clipboard save/restore cycles from overwriting each other. Capacity is 8 takes; beyond that a new take is refused rather than piling up.
+- **HUD shows the backlog**: "2 en attente derrière" while recording, "1 autre en file" while transcribing, and it no longer disappears after a "Collé" when work is still queued behind.
+- **8 unit tests** covering the queue: dictation order, single consumer, capacity, and the take that arrives while the last one is being pasted.
+- **`voxbench`**, a development-only benchmark target that measures transcription cost per segment length and per compute profile. It produced every figure quoted above and is excluded from release builds.
+
 ## [1.0.0] - 2026-08-20
 
 Stability release. VoxPrompt now holds its macOS permissions across updates, never touches your audio output devices, and cannot leave the microphone open. This is the first version considered production ready.
