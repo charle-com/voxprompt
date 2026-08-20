@@ -24,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// il faut donc les reinstaller nous-memes des que le trust bascule.
     private var accessibilityWatch: Timer?
 
+    /// Instant du debut de la prise, pour ecarter les appuis trop brefs.
+    private var recordingStartedAt: Date?
+
     // MARK: Cycle de vie
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -265,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         dictationInFlight = true
+        recordingStartedAt = Date()
         hud.show(state: .recording)
         if Settings.shared.streamingEnabled {
             let session = StreamingSession(transcriber: transcriber)
@@ -278,6 +282,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try recorder.start()
         } catch {
             dictationInFlight = false
+            recordingStartedAt = nil
             streaming = nil
             recorder.sampleHandler = nil
             let nsErr = error as NSError
@@ -300,16 +305,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func stopAndTranscribe(target: NSRunningApplication?) async {
-        guard recorder.isRecording else {
-            dictationInFlight = false
-            return
-        }
+        // NE PAS liberer le verrou ici. Si on n'enregistre pas, de deux choses l'une :
+        // soit aucun cycle n'est en cours et le verrou est deja libre, soit il appartient
+        // a un cycle encore en vol. C'est le cas du relachement synthetise en double par
+        // le watchdog : le second passage liberait le verrou du premier, l'appui suivant
+        // demarrait par-dessus, et les deux collages s'entrelacaient.
+        guard recorder.isRecording else { return }
         defer { dictationInFlight = false }
 
         let session = streaming
         streaming = nil
+        let started = recordingStartedAt
+        recordingStartedAt = nil
         let url = recorder.stop()
         let rms = recorder.lastRMS
+
+        // Appui trop bref pour porter de la parole (clic accidentel, rebond de touche) :
+        // on jette sans rien transcrire. Whisper hallucine volontiers un "Merci." sur
+        // quelques centiemes de seconde de bruit, qui se collerait alors dans l'app active.
+        let duration = started.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        if duration < 0.35 {
+            VPLog.log(String(format: "press too short (%.2fs), dictation discarded", duration))
+            try? FileManager.default.removeItem(at: url)
+            hud.hide()
+            return
+        }
         VPLog.log("stop file=\(url.lastPathComponent) rms=\(rms) target=\(target?.localizedName ?? "?")")
 
         // Whisper hallucine des artefacts d'entrainement quand l'entree est sous le bruit
